@@ -1,0 +1,311 @@
+# Background
+Here I examine ubi-site conservation
+This uses conservation results produced by the scripts in scripts/conservation
+
+# Initialise
+```{r}
+library(tidyverse)
+library(purrr)
+library(ggplot2)
+
+home_directory <- ""
+source(paste0(home_directory, "scripts/essential_visualisations_JvG.R"))
+source("scripts/00_objects.R")
+source("scripts/01_general.R")
+source("scripts/03_visualisations.R")
+
+#Load conservation results
+load("data/conservation/conservationBoxesDfUniq__1.RData")
+conservationBoxesDfUniq <- conservationBoxesDfUniq %>% 
+    mutate(uniprot = gsub("_.+$", "", uniprot_site),
+          pos = as.numeric(position))
+
+# Load sites that went into conservation results
+ubnOmicsSites <- read_delim("scripts/conservation/data/all_sites_ptmdb.tab", delim = "\t")
+```
+
+## Add PhosphositePlus info
+```{r}
+# Load and prep psp sites
+load("data/PSP/PSP_reg_ubCorr__3.RData")
+PSP_reg_ubSub <- subset(PSP_reg_ubCorr, uniprot_site %in% conservationBoxesDfUniq$uniprot_site)
+PSP_reg_ub_FUNC <- split_ON_FUNCTION(PSP_reg_ubSub) 
+protDegSites <- subset(PSP_reg_ub_FUNC, ON_FUNCTION_strp == "protein degradation")$uniprot_site
+otherFuncSites <- subset(PSP_reg_ub_FUNC, ON_FUNCTION_strp != "protein degradation")$uniprot_site
+conservationBoxesDfUniq$PSP_reg <- conservationBoxesDfUniq$uniprot_site %in% PSP_reg_ubSub$uniprot_site
+conservationBoxesDfUniq$PSP_reg_ProtDeg <- conservationBoxesDfUniq$uniprot_site %in% protDegSites
+conservationBoxesDfUniq$PSP_reg_otherFunc <- conservationBoxesDfUniq$uniprot_site %in% otherFuncSites
+conservationBoxesDfUniq$PSP_reg_notProtDeg <- conservationBoxesDfUniq$uniprot_site %in% setdiff(otherFuncSites, protDegSites)
+conservationBoxesDfUniq$PSP_reg_ProtDegOnly <- conservationBoxesDfUniq$uniprot_site %in% setdiff(protDegSites, otherFuncSites)
+```
+
+
+
+# Overview of results
+```{r}
+#Number of sites in each box
+numSitesSumm <- conservationBoxesDfUniq %>% group_by(consBox_LysCont) %>% summarise(n = n()) %>%
+        subset(!is.na(consBox_LysCont)) %>% 
+        mutate(consBox_LysCont_num = gsub("Level", "", consBox_LysCont))
+ggplot(numSitesSumm, aes(x = consBox_LysCont_num, y = n)) +
+    geom_col(fill = alpha(ubiSiteColour2, 0.8), colour = ubiSiteColour2, size = 0.235, width = 0.8) +
+    comfy_theme(include_xaxis = F, rotate_x_text = F) +
+    labs(x = "Conservation level", y = "# ubi-sites")
+ggsave_pdfpng(file = "output/images/conservation/bplot_numBoxSites",
+            width = 1.4, height = 1.5)
+
+#Number of sites per species
+numSitesSpecies <- ubnOmicsSites %>% mutate(ensp_pos = paste(ensp, position, sep = "_")) %>%
+                    group_by(scientific_name) %>% summarise(numSites = length(unique(ensp_pos))) %>%
+                    mutate(scientific_name = factor(scientific_name, 
+                        levels = rev(c("Homo sapiens", 
+                                   "Mus musculus", 
+                                   "Rattus norvegicus", 
+                                   "Gallus gallus", 
+                                   "Drosophila melanogaster", 
+                                   "Caenorhabditis elegans", 
+                                   "Saccharomyces cerevisiae",
+                                   "Arabidopsis thaliana"))))
+levels(numSitesSpecies$scientific_name) <- sapply(levels(numSitesSpecies$scientific_name),
+                                                   function(x) sub("^([A-Za-z])[A-Za-z]*", "\\1.", x))
+numSitesSpecies %>% 
+    subset(scientific_name != "H. sapiens") %>% 
+    ggplot(., aes(y = scientific_name, x = numSites)) +
+        geom_col(fill = ubiSiteColour) +
+        comfy_theme() +
+        theme(axis.line.y = element_blank(),
+              axis.ticks.y = element_blank(),
+              axis.title.y = element_blank(),
+              axis.text.y = element_text(face = "italic")) +
+        labs(x = "# unique ubi-sites")
+ggsave_pdfpng(file = "output/images/conservation/bplot_numSpeciesSites",
+            width = 2, height = 1.75)
+
+# Using ENSP mapping
+numSitesSpecies %>% 
+    mutate(numSites = numSites / 1000) %>% 
+    ggplot(aes(y = scientific_name, x = numSites)) +
+        geom_col(fill = alpha(ubiSiteColour, 0.8), colour = ubiSiteColour, width = 0.8, linewidth = 0.235) +
+        comfy_theme() +
+        theme(axis.line.y = element_blank(),
+              axis.ticks.y = element_blank(),
+              axis.title.y = element_blank(),
+              axis.text.y = element_text(face = "italic", colour = "#353535")) +
+        scale_x_log10(
+      breaks = c(1, 3, 10, 30, 100),
+      minor_breaks = c(2, 4, 5, 6, 7, 8, 9,
+                       20, 40, 50, 60, 70, 80, 90)
+    ) +
+    annotation_logticks(
+      sides = "b", 
+      outside = TRUE, 
+      short = unit(1, "cm"),
+      mid = unit(1, "cm"),
+      long = unit(1, "cm")
+    ) +
+        labs(x = "# unique ubi-sites (1000s)")
+ggsave_pdfpng(file = "output/images/conservation/bplot_numSpeciesSites_wHs",
+            width = 2.2, height = 1.75)
+```
+
+
+# Enrichment of regulatory sites
+```{r}
+#Set up enrichment
+selCols <- c("PSP_reg_ProtDeg", "PSP_reg_notProtDeg", "PSP_reg")
+boxRegSumm <- catBoolSummariser(data = conservationBoxesDfUniq, catCol = "consBox_LysCont",
+                  boolCols = selCols) %>% as.data.frame %>% 
+                  subset(!is.na(consBox_LysCont)) #Get rid of box 0 because it doesn't make sense
+colnames(boxRegSumm) <- colnames(boxRegSumm) %>% 
+                        gsub("PSP_reg_ProtDeg", "protDeg", .) %>% 
+                        gsub("PSP_reg_notProtDeg", "notProtDeg", .) %>%
+                        gsub("PSP_reg", "reg", .)
+
+#Visualise
+prefix <- "output/images/conservation/PSPreg/bplot_boxes_PSP"
+##All regulatory sites
+bplotRegSumm_percAndEnr(regSummDat = boxRegSumm, cols = c("reg"),  
+                        xaxis = "consBox_LysCont", xlab = "Conservation box")$enr +
+                        scale_fill_manual(values = alpha(PSPcolours, 0.8)) +
+                        scale_colour_manual(values = PSPcolours) +
+                        comfy_theme(rotate_x_text = T, include_xaxis = F)
+ggsave_pdfpng(file = paste0(prefix, "_reg"), width = 2.4, height = 1.75)
+##prot deg vs not prot deg
+bplotRegSumm_percAndEnr(regSummDat = boxRegSumm, cols = c("protDeg", "notProtDeg"),  
+                        xaxis = "consBox_LysCont", xlab = "Conservation box")$enr +
+                        scale_fill_manual(values = alpha(PSPcolours, 0.8)) +
+                        scale_colour_manual(values = PSPcolours) +
+                        comfy_theme(rotate_x_text = T, include_xaxis = F)
+ggsave_pdfpng(file = paste0(prefix, "_degVsNotDeg"), width = 2.5, height = 1.75)
+##non deg
+View(boxRegSumm)
+bplotRegSumm_percAndEnr(regSummDat = boxRegSumm, cols = c("notProtDeg"),  
+                        xaxis = "consBox_LysCont", xlab = "Conservation box")$enr +
+                        scale_fill_manual(values = alpha(PSPcolours, 0.8)) +
+                        scale_colour_manual(values = PSPcolours) +
+                        comfy_theme(rotate_x_text = T, include_xaxis = F)
+ggsave_pdfpng(file = paste0(prefix, "_notDeg"), width = 2, height = 1.5)
+##Prot deg
+bplotRegSumm_percAndEnr(regSummDat = boxRegSumm, cols = c("protDeg"),  
+                        xaxis = "consBox_LysCont", xlab = "Conservation box")$enr +
+                        scale_fill_manual(values = alpha(PSPcolours, 0.8)) +
+                        scale_colour_manual(values = PSPcolours) +
+                        comfy_theme(rotate_x_text = T, include_xaxis = F)
+ggsave_pdfpng(file = paste0(prefix, "_Deg"), width = 2, height = 1.5)
+##non deg, numbers on top
+bplotRegSumm_percAndEnr(regSummDat = boxRegSumm, cols = c("notProtDeg"),  
+                        xaxis = "consBox_LysCont", xlab = "Conservation box")$enr +
+                        scale_fill_manual(values = alpha(PSPcolours, 0.8)) +
+                        scale_colour_manual(values = PSPcolours) +
+                        comfy_theme(rotate_x_text = T, include_xaxis = F) +
+                        geom_text(data = boxRegSumm, aes(x = consBox_LysCont, label = num_rows, y = notProtDeg_enr + 0.2),
+                                  size = 1.875*5/5, colour = "#353635",
+                                  inherit.aes = F) +
+                        labs(y = "Fold enrichment")
+ggsave_pdfpng(file = paste0(prefix, "_notDeg_wNums"), width = 2.5, height = 1.75)
+```
+
+
+# Relationship between conservation, regulatory sites, and abundance
+I inspect the potential confounding effects of protein and site abundance
+Note that abundDat is produced by 09_proteinAndSiteAbundance.Rmd
+## Prep data
+```{r}
+load("data/features/abundDat__1.RData")
+abundDat$uniprot_pos <- gsub("_K", "_", rownames(abundDat))
+abundFeatsLog <- colnames(abundDat) %>% .[grep("log$", .)]
+conservationBoxesDfUniq <- left_join(conservationBoxesDfUniq, abundDat, by = "uniprot_pos")
+
+# Set a boolean column to use for regulatory sites, for simplicity
+conservationBoxesDfUniq$regBool <- conservationBoxesDfUniq$PSP_reg_notProtDeg
+```
+
+## Bin protein abundance and compare to regulatory sites
+```{r}
+# Bin protein abundance
+quantBreaks <- c(seq(0, 9, len = 5), 10) / 10 # top 10% plus four other equal groups
+conservationBoxesDfUniq$protAbundance_log_bins <- cutWithQuantBreaks(conservationBoxesDfUniq$protAbundance_log, quantBreaks)
+conservationBoxesDfUniq$protAbundance_log_binsLab <- conservationBoxesDfUniq$protAbundance_log_bins
+levels(conservationBoxesDfUniq$protAbundance_log_binsLab) <- paste0("Abun", 1:(length(quantBreaks) - 1))
+
+# Count regulatory sites
+abundConsRegSumm <- conservationBoxesDfUniq %>% 
+  subset(!is.na(protAbundance_log_bins) & !is.na(consBox_LysCont)) %>%  
+  group_by(protAbundance_log_bins, consBox_LysCont) %>% 
+  summarise(numReg = sum(regBool), numNotReg = sum(!regBool)) %>% ungroup
+## Visualise
+abundConsRegSumm %>% 
+  dplyr::select(-c("numNotReg")) %>%
+  pivot_wider(names_from = "consBox_LysCont", values_from = "numReg")
+## Simply count number of reg sites at each level
+conservationBoxesDfUniq %>% group_by(protAbundance_log_bins) %>% summarise(numReg = sum(regBool))
+```
+
+Enrichment within protein abundance bins
+```{r}
+selCols <- c("PSP_reg_notProtDeg")
+lst <- conservationBoxesDfUniq %>% 
+  subset(!is.na(protAbundance_log_bins) & !is.na(consBox_LysCont)) %>% 
+  split(.$protAbundance_log_bins)
+boxRegSumm_abunBin <- map_dfr(lst, function(dat){
+  catBoolSummariser(data = dat, catCol = "consBox_LysCont",
+                    boolCols = selCols) %>% as.data.frame %>% 
+                    subset(!is.na(consBox_LysCont))
+}, .id = "protAbundance_log_bins")
+
+# Visualise log fold enrichment
+boxRegSumm_abunBin <- boxRegSumm_abunBin %>% 
+  mutate(logEnr = log2(PSP_reg_notProtDeg_enr)) 
+maxVal <- boxRegSumm_abunBin$logEnr %>% abs %>% .[which(. != Inf)] %>% max(., na.rm = T)
+boxRegSumm_abunBin %>%
+  ggplot(., aes(x = consBox_LysCont, y = protAbundance_log_bins, fill = logEnr, label = PSP_reg_notProtDeg_num)) + 
+  geom_tile() + 
+  geom_text(hjust = 0.5, colour = "#464646", size = 1.875*4/5) + 
+  coord_fixed() + comfy_theme(rotate_x_text = T) + 
+  scale_fill_gradientn(colors = rev(brewer.pal(9, "RdBu")), limits = c(-maxVal, maxVal), name = "log Enr") + 
+  labs(x = "Conservation", y = "Protein abundance log", title = "Enrichment of PSP reg sites")
+ggsave_pdfpng(file = "output/images/conservation/PSPreg/hmap_cons_PSPnotDeg_protAbund", width = 2.5, height = 2)
+```
+
+
+## Bin site abundance and compare to regulatory sites
+```{r}
+# Bin protein abundance
+quantBreaks <- c(seq(0, 9, len = 5), 10) / 10 # top 10% plus five other equal groups
+conservationBoxesDfUniq$PSMcounts_log_bins <- cutWithQuantBreaks(conservationBoxesDfUniq$PSMcounts_log, quantBreaks)
+table(conservationBoxesDfUniq$PSMcounts_log_bins)
+conservationBoxesDfUniq$PSMcounts_log_bins[which(conservationBoxesDfUniq$PSMcounts_log == 0)] <- levels(conservationBoxesDfUniq$PSMcounts_log_bins)[1]
+table(conservationBoxesDfUniq$PSMcounts_log_bins)
+conservationBoxesDfUniq$PSMcounts_log_binsLab <- conservationBoxesDfUniq$PSMcounts_log_bins
+levels(conservationBoxesDfUniq$PSMcounts_log_binsLab) <- paste0("Abun", 1:(length(quantBreaks) - 1))
+
+# Count regulatory sites
+abundConsRegSumm <- conservationBoxesDfUniq %>% 
+  subset(!is.na(PSMcounts_log_bins) & !is.na(consBox_LysCont)) %>%  
+  group_by(PSMcounts_log_bins, consBox_LysCont) %>% 
+  summarise(numReg = sum(regBool), numNotReg = sum(!regBool)) %>% ungroup
+## Visualise
+abundConsRegSumm %>% 
+  dplyr::select(-c("numNotReg")) %>%
+  pivot_wider(names_from = "consBox_LysCont", values_from = "numReg")
+## Simply count number of reg sites at each level
+conservationBoxesDfUniq %>% group_by(PSMcounts_log_bins) %>% summarise(numReg = sum(regBool))
+```
+
+Enrichment within protein abundance bins
+```{r}
+selCols <- c("PSP_reg_notProtDeg")
+lst <- conservationBoxesDfUniq %>% 
+  subset(!is.na(PSMcounts_log_bins) & !is.na(consBox_LysCont)) %>% 
+  split(.$PSMcounts_log_bins)
+boxRegSumm_PSMBin <- map_dfr(lst, function(dat){
+  catBoolSummariser(data = dat, catCol = "consBox_LysCont",
+                    boolCols = selCols) %>% as.data.frame %>% 
+                    subset(!is.na(consBox_LysCont))
+}, .id = "PSMcounts_log_bins")
+
+# Visualise log fold enrichment
+boxRegSumm_PSMBin <- boxRegSumm_PSMBin %>% 
+  mutate(logEnr = log2(PSP_reg_notProtDeg_enr)) 
+maxVal <- boxRegSumm_PSMBin$logEnr %>% abs %>% .[which(. != Inf)] %>% max(., na.rm = T)
+boxRegSumm_PSMBin %>%
+  ggplot(., aes(x = consBox_LysCont, y = PSMcounts_log_bins, fill = logEnr, label = PSP_reg_notProtDeg_num)) + 
+  geom_tile() + 
+  geom_text(hjust = 0.5, colour = "#464646", size = 1.875*4/5) + 
+  coord_fixed() + comfy_theme(rotate_x_text = T) + 
+  scale_fill_gradientn(colors = rev(brewer.pal(9, "RdBu")), limits = c(-maxVal, maxVal), name = "log Enr") + 
+  labs(x = "Conservation", y = "PSM counts log", title = "Enrichment of PSP reg sites")
+ggsave_pdfpng(file = "output/images/conservation/PSPreg/hmap_cons_PSPnotDeg_PSM", width = 2.5, height = 2)
+```
+
+
+## Account for both protein abundance and site abundance
+Look only in bottom 90% of protein and site abundace
+```{r}
+# Filter
+filterUnderQuantile <- function(dat, col, maxQuant = 0.9){
+  q <- quantile(dat[, col], maxQuant, na.rm = T)
+  dat %>% .[!is.na(.[, col]), ] %>% .[which(.[, col] < q), ]
+}
+datFilt <- conservationBoxesDfUniq %>% 
+  filterUnderQuantile(., "protAbundance_log", 0.9) %>% 
+  filterUnderQuantile(., "PSMcounts_log", 0.9)
+# Count number of reg sites at each consevation level
+conservationBoxesDfUniq %>% group_by(consBox_LysCont) %>% summarise(numReg = sum(regBool))
+datFilt %>% group_by(consBox_LysCont) %>% summarise(numReg = sum(regBool))
+# Enrichment at each conservation level
+selCols <- c("PSP_reg_notProtDeg")
+boxRegSumm_bottom90 <- catBoolSummariser(
+  data = datFilt, catCol = "consBox_LysCont",
+  boolCols = selCols) %>% as.data.frame %>% 
+  subset(!is.na(consBox_LysCont))
+## Plot
+bplotRegSumm_percAndEnr(regSummDat = boxRegSumm_bottom90, cols = c("PSP_reg_notProtDeg"),  
+                        xaxis = "consBox_LysCont", xlab = "Conservation box")$enr +
+                        scale_fill_manual(values = alpha(PSPcolours, 0.8)) +
+                        scale_colour_manual(values = PSPcolours) +
+                        comfy_theme(rotate_x_text = T, include_xaxis = F) + geom_text(data = boxRegSumm_bottom90, aes(x = consBox_LysCont, label = PSP_reg_notProtDeg_num, y = PSP_reg_notProtDeg_enr + 0.2),
+                                  size = 1.875*5/5, colour = "#353635",
+                                  inherit.aes = F) 
+ggsave_pdfpng(file = "output/images/conservation/PSPreg/bplot_boxes_PSP_notDeg_ProtAbunPSMBot90", width = 2, height = 1.5)
+```

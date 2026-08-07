@@ -1,0 +1,109 @@
+# Background
+Here I perform some small analysis comparing different measure of protein and site abundance
+I export abundance data that is used in other notebooks
+
+# Initialise
+```{r}
+library(tidyverse)
+library(purrr)
+library(ggplot2)
+library(caret)
+library(openxlsx)
+
+home_directory <- ""
+source(paste0(home_directory, "scripts/essential_visualisations_JvG.R"))
+source(paste0(home_directory, "scripts/caret_JvG.R"))
+source("scripts/00_objects.R")
+source("scripts/01_general.R")
+
+#Load data
+load("data/features/ubiFeatProc__1.RData")
+ubiFeatProc <- as.data.frame(ubiFeatProc)
+rownames(ubiFeatProc) <- ubiFeatProc$uniprot_site
+
+load("data/features/ubnOmics/ubnOmicsFeauresAll__4.RData")
+
+ubiFeatProc <- left_join(ubiFeatProc, 
+                           ubnOmicsFeaturesAll[, c("uniprot_pos", "numQuant_all")],
+                           by = "uniprot_pos") %>% as.data.frame
+rownames(ubiFeatProc) <- ubiFeatProc$uniprot_site
+```
+
+# Set up protein and site abundance features
+```{r}
+# Get features
+abundFeats <- c(
+     "abundance" = "protAbundance",
+     "Sum_of_PSM_counts(5%FLR)" = "PSMcounts",
+      "numQuant_all" =  "numQuant_all"
+)
+abundDat <- ubiFeatProc[, names(abundFeats)] %>% 
+    dplyr::rename(!!!setNames(names(abundFeats), abundFeats))
+# Transform with log(1+x)
+for (col in abundFeats){
+    abundDat[, paste0(col, "_log")] <- log(abundDat[, col])
+}
+abundFeatsLog <- colnames(abundDat) %>% .[grep("log$", .)]
+```
+
+# Explore features
+## Visualise
+```{r}
+# Distributions
+longDat <- abundDat[, abundFeatsLog] %>% 
+    pivot_longer(cols = all_of(abundFeatsLog), names_to = "col", values_to = "val")
+ggplot(longDat, aes(x = val)) + 
+    geom_histogram() + comfy_theme() + 
+    facet_wrap(~col, scales = "free")
+
+# Correlations
+## Set up
+#Make colour scale
+library(viridis)
+colScale <- c(seq(0, 0.25, length.out = 6 + 1)[-1], 
+            seq(0.25, 0.7, length.out = 5 + 1)[-1], 1) 
+hexScale <- scale_fill_gradientn(colours = viridis(10), 
+                        values = rescale(colScale, c(0, 1)), 
+                        limits = c(1, NA), name = "# sites")
+## Plot
+pltLst <- list()
+k <- 1
+for (i in 1:length(abundFeatsLog)){
+    for (j in 1:length(abundFeatsLog)){
+        vars <- c(abundFeatsLog[i], abundFeatsLog[j])
+        plt <- ggplot(abundDat, aes(x = !!sym(vars[1]), y = !!sym(vars[2]))) + 
+            geom_hex(bins = 50) + 
+            comfy_theme() + hexScale
+        pltLst[[k]] <- plt 
+        k <- k + 1
+    }
+}
+ggarrange(plotlist = pltLst, nrow = length(abundFeatsLog), ncol = length(abundFeatsLog))
+ggsave_pdfpng(file = "output/images/abundance/hex_abundFeats_corr", width = 8, height = 6)
+```
+
+## Correlate features with each other
+```{r}
+cor(abundDat[, abundFeatsLog], use = "pairwise.complete.obs")
+```
+
+## Plot distributions with quantile cutting
+```{r}
+quantBreaks <- c(seq(0, 9, len = 5), 10) / 10
+
+# Protein abundance
+for (var in abundFeatsLog){
+   ggplot(abundDat, aes(x = !!sym(var))) + 
+        geom_histogram() + 
+        geom_vline(xintercept = quantile(abundDat[, var], quantBreaks, na.rm = T), colour = "red", size = 0.235, alpha = 0.7) + 
+        comfy_theme() + 
+        labs(x = var, y = "# ubi-sites") + 
+        ggtitle("Binning sites")
+    ggsave_pdfpng(file = paste0("output/images/abundance/hist_quantiles_", var), width = 2, height = 2) 
+}
+```
+
+# Export abundance features
+```{r}
+save(abundDat, file = "output/data/abundDat__1.RData")
+```

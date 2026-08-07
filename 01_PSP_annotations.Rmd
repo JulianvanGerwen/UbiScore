@@ -1,0 +1,164 @@
+# Background
+Here I explore PhosphositePlus annotations for regulatory ubn sites
+
+# Initialise
+```{r}
+library(tidyverse)
+library(purrr)
+library(ggplot2)
+
+home_directory <- ""
+source(paste0(home_directory, "scripts/essential_visualisations_JvG.R"))
+source("scripts/01_general.R")
+
+#Load PSP data
+PSP_reg_raw <- read_delim(paste(home_directory, "data/biol_databases/phosphosite_plus/DATE/Regulatory_sites", sep = "")) %>%
+  as.data.frame
+PSP_reg_hs <- subset(PSP_reg_raw, ORGANISM == "human")
+```
+
+Load in relevant proteomes
+```{r}
+##Function: read in a fasta file of protein sequences and convert them into a data frame
+library(seqinr)
+read_fastaseq <- function(directory){
+  seqs_raw <- read.fasta(directory)
+  seqs <- data.frame("sequence" = map(seqs_raw, ~paste(., collapse = "")) %>% unlist)
+  seqs$sequence <- toupper(seqs$sequence)
+  seqs$uniprotkb <- strsplit(rownames(seqs), "\\|") %>% map(~.[2]) %>% unlist
+  return(seqs)
+}
+##Load proteomes
+uniprotHsIso <- read_fastaseq(paste(home_directory, 
+                                         "data/biol_databases/uniprot/uniprotkb_proteome_UP000005640_2025_02_19.fasta", sep = ""))
+uniprotHsIsoRevi <- read_fastaseq(paste(home_directory, 
+                                         "data/biol_databases/uniprot/uniprotkb_proteome_UP000005640_AND_revi_2025_02_19.fasta", sep = ""))
+```
+
+
+# Clean ub modifications
+```{r}
+#Compare AAs to uniprot proteome
+PSP_reg_ub$position <- as.numeric(gsub("[A-Z]", "", PSP_reg_ub$site))
+PSP_reg_ub$AA <- gsub("[0-9]", "", PSP_reg_ub$site)
+##Remove non-K (only one)
+PSP_reg_ub <- subset(PSP_reg_ub, AA == "K")
+##Extract corresponding uniprot AAs
+PSP_reg_ub$unipInProteome <- PSP_reg_ub$ACC_ID %in% uniprotHsIso$uniprotkb
+uniprotHsIsoSub <- subset(uniprotHsIso, uniprotkb %in% PSP_reg_ub$ACC_ID)
+PSP_reg_ub$unipAA <- NA
+PSP_reg_ub$unipSeqWind <- NA
+for (i in which(PSP_reg_ub$unipInProteome == T)){
+  seq <- paste(c(rep("_", 7),
+                 uniprotHsIsoSub$sequence[which(uniprotHsIsoSub$uniprotkb == PSP_reg_ub$ACC_ID[i])],
+                 rep("_", 7)), collapse = "")
+  pos <- PSP_reg_ub$position[i]
+  PSP_reg_ub$unipAA[i] <- substr(seq, pos + 7, pos + 7)
+  PSP_reg_ub$unipSeqWind[i] <- substr(seq, pos, pos + 14)
+}
+PSP_reg_ub$AAmismatch <- PSP_reg_ub$AA != PSP_reg_ub$unipAA
+
+##Inpsect 
+table(PSP_reg_ub$unipAA)
+PSP_reg_ub %>% subset(unipAA != AA) %>% .[, c("SITE_+/-7_AA", "unipSeqWind")]
+
+##Correct by alignment
+find_aa_position <- function(subseq, protein_seq) {
+  # Remove "_" characters from the substring
+  clean_subseq <- gsub("_", "", subseq)
+  
+  # Find all matches of the cleaned substring in the protein sequence
+  match_positions <- gregexpr(clean_subseq, protein_seq)[[1]]
+  
+  # If no match is found, return NA
+  if (match_positions[1] == -1) {
+    return(NA)
+  }
+  
+  # Find the position corresponding to the modified AA
+  central_index <- ceiling(nchar(subseq) / 2)
+  mod_index <- central_index - gregexpr(clean_subseq, subseq)[[1]][[1]] + 1
+  
+  
+  # Calculate the position(s) of the central AA in the protein
+  central_positions <- match_positions + mod_index - 1
+  
+  
+  return(central_positions)
+}
+PSP_reg_ub$positionCorrected <- PSP_reg_ub$position
+for (i in which(PSP_reg_ub$AAmismatch == T)){
+  seq <- uniprotHsIsoSub$sequence[which(uniprotHsIsoSub$uniprotkb == PSP_reg_ub$ACC_ID[i])]
+  matches <- find_aa_position(subseq = toupper(PSP_reg_ub$`SITE_+/-7_AA`[i]), protein_seq = seq)[[1]]
+  if (length(matches) != 1){
+    PSP_reg_ub$positionCorrected[i] <- NA
+  } else {
+    PSP_reg_ub$positionCorrected[i] <- matches
+  }
+}
+##Redefine columns
+PSP_reg_ubCorr <- PSP_reg_ub %>%
+  mutate(position = positionCorrected) %>% 
+  mutate(site = paste(AA, positionCorrected, sep = "")) %>%
+  mutate(uniprot_site = paste(ACC_ID, site, sep = "_")) %>% 
+  dplyr::select(-c("positionCorrected", "unipAA", "unipSeqWind", "AAmismatch"))
+##Re-extract uniprot sequence info
+PSP_reg_ubCorr$unipAA <- NA
+PSP_reg_ubCorr$unipSeqWind <- NA
+for (i in which(PSP_reg_ubCorr$unipInProteome == T)){
+  seq <- paste(c(rep("_", 7),
+                 uniprotHsIsoSub$sequence[which(uniprotHsIsoSub$uniprotkb == PSP_reg_ub$ACC_ID[i])],
+                 rep("_", 7)), collapse = "")
+  pos <- PSP_reg_ubCorr$position[i]
+  PSP_reg_ubCorr$unipAA[i] <- substr(seq, pos + 7, pos + 7)
+  PSP_reg_ubCorr$unipSeqWind[i] <- substr(seq, pos, pos + 14)
+}
+
+#Two sites are non-unique after I correct uniprot_site. Here I fix this.
+collapse_values <- function(x) {
+  if (is.character(x)) {
+    # Split each element by ";" then collapse unique values back together
+    paste(unique(unlist(strsplit(x, ";"))), collapse = ";")
+  } else {
+    # For non-character columns, keep the first value
+    x[1]
+  }
+}
+PSP_reg_ubCorr <- PSP_reg_ubCorr %>%
+  dplyr::group_by(uniprot_site) %>%
+  dplyr::summarise(dplyr::across(dplyr::everything(), collapse_values), .groups = "drop")
+```
+
+
+
+# Export
+```{r}
+save(PSP_reg_ubCorr, file = "output/data/PSP_reg_ubCorr__3.RData")
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

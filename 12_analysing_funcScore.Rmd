@@ -1,0 +1,884 @@
+# Background
+Here I analyse the positional importance score
+
+# Initialise
+```{r}
+library(tidyverse)
+library(purrr)
+library(ggplot2)
+library(ggridges)
+library(readxl)
+library(openxlsx)
+library(data.table)
+
+home_directory <- ""
+source(paste0(home_directory, "scripts/essential_visualisations_JvG.R"))
+source(paste0(home_directory, "scripts/enrichment_analysis_JvG.R"))
+source("scripts/01_general.R")
+source("scripts/00_objects.R")
+source("scripts/03_visualisations.R")
+source("scripts/04_ubnOmics.R")
+source("scripts/17_linear_models.R")
+
+#Load data
+load("data/functional_scores/ubiFeatPreds__7.RData")
+load("data/features/ubnOmics/ubnOmicsFeauresAll__4.RData")
+load("data/features/ubnOmics/ubnOmicsComp_hsPRIDE_lst__8.RData")
+load("data/hotspots/hotspotSites__3.RData")
+
+#Set up bin breaks for the functional score, and other aesthetic paramters
+funcScoreBreaks <- c(0, 0.2, 0.4, 0.6, 0.8, 1)
+funcScoreBinCols <- brewer.pal(9, "Blues")[c(1, 3, 5, 7, 9)]
+funcScoreFillAlpha <- 0.3
+
+#Get gene identifiers for our ubi sites
+library(AnnotationDbi)
+library(org.Hs.eg.db)
+collapseFunc <- function(x){
+    x <- unique(x)
+    if (is.na(x[1])){
+        return(NA)
+    } else {
+        return(paste(x, collapse = ";"))
+    }
+}
+geneMap <- AnnotationDbi::select(org.Hs.eg.db, keys = unique(ubiFeatPreds$uniprot), keytype = "UNIPROT",
+                                    columns = c("SYMBOL")) %>% 
+                                group_by(UNIPROT) %>% 
+                                summarise(gene = collapseFunc(SYMBOL))
+ubiFeatPreds <- left_join(ubiFeatPreds, dplyr::rename(geneMap, "uniprot" = "UNIPROT"), by = "uniprot")
+##Expand out by gene when they are not unique
+ubiFeatPreds_byGene <- separate_rows(ubiFeatPreds, "gene", sep = ";") %>% 
+                        mutate(gene_site = paste(gene, site, sep = "_")) 
+```
+
+```{r}
+## Add quantile-normalised score and rank within protein
+ubiFeatPreds <- ubiFeatPreds %>%
+    group_by(uniprot) %>%
+    mutate(
+        numUbiSites = sum(!is.na(functional_score)),
+        funcScoreRank = if_else(numUbiSites > 0, rank(-functional_score, ties.method = "first"), NA_integer_),
+        funcScoreQuant = to_quantiles(functional_score),
+        numUbiSites = if_else(numUbiSites > 0, numUbiSites, NA_integer_)
+    ) %>%
+    ungroup() %>%
+    as.data.frame()
+```
+
+# Overview
+## Score distributions and number of sites
+```{r}
+#Plot non-protdeg vs unannotated sites
+plotDat <- ubiFeatPreds %>%
+    subset(!is.na(trainingClass)) %>% 
+    subset(!is.na(functional_score))
+median_lines <- plotDat %>%
+  group_by(trainingClass) %>%
+  summarize(
+    med = median(functional_score),
+    density_at_median = {
+      d <- density(functional_score)
+      approx(d$x, d$y, xout = median(functional_score))$y
+    }
+  )
+ggplot(plotDat, aes(x = functional_score, y = trainingClass, fill = trainingClass)) +
+    geom_density_ridges(linewidth = 0.235) +
+    geom_vline(xintercept = median_lines$med, color = "black", size = 0.235) +
+    comfy_theme() +
+    scale_fill_manual(values = setNames(c(PSPcolours["reg"], "#e5e5e5"), c("Positive", "Negative")),
+                      labels = c("Regulatory", "Unannotated")) +
+    lims(x = c(0, 1)) +
+    labs(x = "Functional score")
+ggsave_pdfpng(file = "output/images/functional_scores/overview/ridge_funcScoreDist",
+                width = 3.25, height = 1.5)
+
+#How many sites at different cutoffs?
+##Score cutoff that recovers 50% of nondeg sites
+scoreCutoff <- subset(ubiFeatPreds, trainingClass == "Positive" & !is.na(functional_score))$functional_score %>% median
+print(scoreCutoff)
+scoreCutoff <- 0.65
+table(ubiFeatPreds$trainingClass == "Positive", ubiFeatPreds$functional_score > scoreCutoff)
+
+fishers_DE_pathway(background_genes = ubiFeatPreds$uniprot_site,
+                   pathway_genes = subset(ubiFeatPreds, trainingClass == "Positive")$uniprot_site, 
+                   DE_genes = subset(ubiFeatPreds, functional_score > scoreCutoff)$uniprot_site)
+
+# How many sites in each class?
+table(ubiFeatPreds$trainingClass)
+```
+
+
+# Feature importance 
+```{r}
+# Load model
+load("data/functional_scores/finalModel_logregs_coeffs__attempt11_revisions.RData")
+bplot_coeffs(finalModel_logregs_coeffs)
+ggsave_pdfpng(file = "output/images/functional_scores/featureImportance/bplot_featImp_featGroups",
+                width = 2.75, height = 2.25)
+```
+
+
+# Regulation in omics data
+## Proteasome inhibition
+```{r}
+# Add prtsm inhib data
+prtsmInhibCols <- c("Bortezomib_meanlog2FC", "MG-132_meanlog2FC", "Epoxomicin_meanlog2FC")
+if (length(intersect(prtsmInhibCols, colnames(ubiFeatPreds))) == 0){
+    ubiFeatPreds <- left_join(ubiFeatPreds, ubnOmicsFeaturesAll[, c("uniprot_pos", prtsmInhibCols)],
+                                by = "uniprot_pos")
+}
+
+# Bin score
+binBreaks <- funcScoreBreaks
+binN <- length(binBreaks)
+binDat <- binner(data = subset(ubiFeatPreds, !is.na(functional_score)), 
+                valCol = "functional_score", breakType = "float",
+                bin_breaks = binBreaks)
+
+# Pivot by inhibitor type
+binDat <- pivot_longer(binDat, cols = prtsmInhibCols, names_to = "treatType", values_to = "logFC") %>% 
+            mutate(treatType = factor(treatType, levels = prtsmInhibCols))
+levels(binDat$treatType) <- gsub("_meanlog2FC$", "", levels(binDat$treatType))
+
+
+# Plot
+## Violin
+pltLst <- map(levels(binDat$treatType), function(lev){
+    plt <- binDat %>% subset(treatType == lev) %>%
+        subset(abs(logFC) < 5) %>%
+        ViolBoxplot(., vars = list(x = "Bin", y = "logFC", colour = "Bin", fill = "Bin"), includeLegend = F) +
+        geom_hline(yintercept = 0, linewidth = 0.235, linetype = "dashed")  +
+        scale_colour_manual(values = rep(brewer.pal(9, "Blues")[9], binN)) +
+        scale_fill_manual(values = alpha(funcScoreBinCols, funcScoreFillAlpha)) +
+        labs(x = "Functional score", y = "Avg. log2FC (vs control)") +
+        ggtitle(lev)
+    return(plt)
+})
+ggarrange(plotlist = pltLst, nrow = 1)
+ggsave_pdfpng(file = "output/images/functional_scores/regulation/viol_funcScore_prtsmInhib",
+                width = 6, height = 2)
+
+## Dot with IQR
+pltLst <- map(levels(binDat$treatType), function(lev){
+    plt <- binDat %>% subset(treatType == lev) %>%
+        MeanIQRPlot(., vars = list(x = "Bin", y = "logFC", colour = "Bin"), includeLegend = F, pointSize = 3) +
+        geom_hline(yintercept = 0, linewidth = 0.235, linetype = "dashed")  +
+        scale_colour_manual(values = rep(ubiSiteColour, binN)) +
+        labs(x = "Functional score", y = "Avg. log2FC (vs control)") +
+        ggtitle(lev)
+ plt
+})
+ggarrange(plotlist = pltLst, nrow = 1)
+ggsave_pdfpng(file = "output/images/functional_scores/regulation/meanIQR_funcScore_prtsmInhib",
+                width = 5.25, height = 2)
+```
+
+## Linear models to test significance
+```{r}
+prepModelResults_prtmsi <- function(x){
+  x %>% subset(termType == "main effect") %>%
+    dplyr::relocate("model") %>%
+    dplyr::select(-"termType") %>%
+    mutate(model = factor(model, levels = c("MG-132", "Bortezomib", "Epoxomicin"))) %>%
+    .[order(.$model), ] %>%
+    mutate(term = gsub("Bin", "", term)) %>%
+    distinct %>%
+    dplyr::rename(
+      "Treatment" = "model",
+      "Main effect term" = "term",
+      "Term estimate" = "Estimate"
+    )
+}
+
+lmLst <- map(levels(binDat$treatType), function(lev){
+  subDat <- subset(binDat, treatType == lev)
+  lm(logFC ~ Bin, data = subDat)
+})
+names(lmLst) <- levels(binDat$treatType)
+coefDat <- format_model_coefs(lmLst)
+
+coefDat_prtmsi <- prepModelResults_prtmsi(coefDat)
+write.csv(coefDat_prtmsi, file = "output/data/functional_scores/coefDat_prtmsi_linearModels.csv")
+```
+
+
+# Nuclear localisation signals
+## Extract and process from uniprot API search
+```{r}
+load("output/data/structure/domainDat_cache.RData")  # This loads domainDatRaw
+
+#Process domain annotations + similar
+domainProcessArgs <-  c("Motif", "MOTIF", "motif")
+domainDat <- filter(domainDatRaw, !is.na(!!sym(domainProcessArgs[1]))) %>% as.data.frame
+#Process annotations
+annot <- domainDat[, domainProcessArgs[1]]
+annot <- gsub(paste0("^", domainProcessArgs[2], " "), "", annot)
+##Split multiple annotations per uniprot
+annotSplt <- strsplit(annot, paste0("; ", domainProcessArgs[2], " "))
+##Add in uniprot
+annotSplt <- map2(annotSplt, rownames(domainDat), function(x, y){paste(y, x, sep = "; ")})
+##Unlist and process individually
+annotSpltUnlst <- unlist(annotSplt)
+##Extract info
+annotProcLst <- list()
+for (i in 1:length(annotSpltUnlst)){
+    annotChar <- annotSpltUnlst[i]
+    annotCharSplt <- strsplit(annotChar, "; ")[[1]]
+    #Remove matches that have ? or are isoforms
+    if (grepl("?", annotCharSplt[2], fixed = T) | 
+        grepl("-", annotCharSplt[2], fixed = T)){
+        annotProcLst[[i]] <- NULL
+    } else {
+        resLst <- list()
+        ##Get sequence positions
+        vecSplt <- strsplit(annotCharSplt[2], "..", fixed = T)
+        sequence <- map(vecSplt, function(y){
+            if (length(y) == 1){
+            return(as.numeric(y))
+            } else {
+            return(y[1]:y[2])
+            }
+        }) %>% unlist
+        resLst$sequence <- sequence
+        ##Get other info
+        resLst$note <- gsub("/note=", "", annotCharSplt[3], fixed = T)
+        resLst$evidence <- gsub("/evidence=", "", annotCharSplt[4], fixed = T)
+        resLst$uniprot <- annotCharSplt[1]
+        annotProcLst[[i]] <- resLst
+    }
+}
+nullBool <- map(annotProcLst, ~is.null(.)) %>% unlist
+annotProcLst <- annotProcLst[!nullBool]
+#Make motif UID
+for (i in 1:length(annotProcLst)){
+    annotProcLst[[i]]$UID <- paste0("motif", i)
+}
+
+#Map ubi-sites into motifs
+relevantUnips <- map(annotProcLst, ~.$uniprot) %>% unlist %>% unique
+ubnSitesLst <- ubiFeatPreds %>% subset(uniprot %in% relevantUnips) %>% split(.$uniprot) %>% map(~.$pos)
+for (i in 1:length(annotProcLst)){
+    annotProcLst[[i]]$ubiSites <- NA
+    x <- annotProcLst[[i]]
+    unip <- x$uniprot 
+    motifPosns <- x$sequence
+    sites <- ubnSitesLst[[unip]]
+    int <- intersect(sites, motifPosns)
+    if (length(int) != 0){
+      sites <- paste(unip, int, sep = "_")
+      annotProcLst[[i]]$ubiSites <- sites
+    } 
+  }
+annotProcLst_wUbi <- annotProcLst[map(annotProcLst, ~!is.na(.$ubiSites[1])) %>% unlist]
+
+#Extract info for ubi-sites in motifs
+ubisitesMotifsDf <- map(annotProcLst_wUbi, function(x){
+    data.frame("motifID" = x$UID, "motifNote" = x$note, "motifEvidence" = x$evidence, 
+               "uniprot_pos" = paste(x$ubiSites, sep = ";"))
+}) %>% 
+purrr::reduce(rbind) %>% 
+separate_rows("uniprot_pos", sep = ";") %>% 
+group_by(uniprot_pos) %>% 
+summarise(
+    motifID = paste(motifID, collapse = ";"),
+    motifNote = paste(motifNote, collapse = ";"),
+    motifEvidence = paste(motifEvidence, collapse = ";")
+)
+
+#Add to feats df
+ubiFeatPreds <- left_join(ubiFeatPreds, ubisitesMotifsDf, by = "uniprot_pos")
+ubiFeatPreds$inNLS <- grepl("nuclear localization signal", tolower(ubiFeatPreds$motifNote))
+
+table(ubiFeatPreds$inNLS)
+
+#Export
+ubiFeatPreds_NLS <- ubiFeatPreds[, c("uniprot_site", "inNLS", colnames(ubiFeatPreds)[grep("^motif", colnames(ubiFeatPreds))])]
+save(ubiFeatPreds_NLS, file = "output/data/functional_scores/ubiFeatPreds_NLS__7.RData")
+```
+
+
+## Inspect NLSs
+```{r}
+# Functional scores
+## Visualise
+NLSCols <- setNames(c("#6356a5", PSPcoloursLine["notReg"]), c("Yes", "No"))
+ubiFeatPreds <- mutate(ubiFeatPreds, inNLSfact = factor(make.names(1*inNLS), levels = c("X0", "X1")))
+levels(ubiFeatPreds$inNLSfact) <- c("No", "Yes")
+### Label sites
+sitesToLabel <- c("P38936_K154", "Q01469_K24", "Q01469_K34", "Q9UBU8_K143")
+labelDat <- subset(ubiFeatPreds, uniprot_site %in% sitesToLabel) %>% 
+            mutate(gene_site_nice = paste(gene, site, sep = " "))
+
+### Plot
+ubiFeatPreds %>%
+ViolBoxplot(., vars = list(x = "inNLSfact", y = "functional_score", colour = "inNLSfact", fill = "inNLSfact"),
+                includeLegend = F) + 
+    geom_point(data = labelDat, aes(x = inNLSfact, y = functional_score),
+                shape = 21, size = 1, stroke = 0.71*0.25, colour = "black", fill = alpha(NLSCols[1], 0.8), 
+                inherit.aes = F) + 
+    geom_text(data = labelDat, aes(x = inNLSfact, y = functional_score, label = gene_site_nice), 
+              colour = "#3f3f3e", size = 1.875*5/5) +
+    scale_colour_manual(values = NLSCols) +
+    scale_fill_manual(values = alpha(NLSCols, 0.2)) + 
+    labs(x = "Ubi-site in NLS", y = "Positional importance score") +
+    ggtitle("Nuclear localisation sequences")
+ggsave_pdfpng(file = "output/images/functional_scores/NLS/viol_inNLS_funcScore",
+                width = 1.6, height = 1.8)
+
+### Test
+wilcox.test(functional_score ~ inNLSfact, data = ubiFeatPreds)
+
+## Filter
+cutoff <- 0.65
+print(paste0("NLS ubi-sites with score > ", cutoff))
+print(length(which(ubiFeatPreds$inNLS == T & ubiFeatPreds$functional_score > cutoff)))
+NLSfuncSites <- ubiFeatPreds[which(ubiFeatPreds$inNLS == T & ubiFeatPreds$functional_score > cutoff), ]
+table("score" = ubiFeatPreds$functional_score > cutoff, "NLS" = ubiFeatPreds$inNLS == T)
+
+# Inspect
+NSLSites_summ <- ubiFeatPreds[which(ubiFeatPreds$inNLS == T & !is.na(ubiFeatPreds$functional_score)), ] %>% 
+    group_by(uniprot) %>% 
+    mutate(protMean = mean(functional_score, na.rm = TRUE)) %>% 
+    ungroup() %>% 
+    .[order(.$protMean, decreasing = T), ] %>% 
+    dplyr::relocate(c("functional_score", "BortMG_meanlog2FC", "gene")) 
+NSLfuncSites_summ <- NLSfuncSites %>% 
+    group_by(uniprot) %>% 
+    mutate(protMean = mean(functional_score, na.rm = TRUE)) %>% 
+    ungroup() %>% 
+    .[order(.$protMean, decreasing = T), ] %>% 
+    dplyr::relocate(c("functional_score", "BortMG_meanlog2FC", "gene")) 
+write.csv(NSLfuncSites_summ, file = "output/data/functional_scores/NLSfuncSites.csv", na = "")
+
+# Export for supplementary table
+renameCols <- c(
+    "uniprot_site" = "ubi-site",
+    "functional_score" = "Functional score",
+    "gene" = "Gene",
+    "motifNote" = "UNIPROT motifs"
+)
+NSLSites_summExp <- NSLSites_summ[, names(renameCols)] %>% 
+    dplyr::rename(!!!setNames(names(renameCols), renameCols))
+# Export
+outDir = "output/data/functional_scores/SuppTable_predFuncSites.xlsx"
+sheet = "NLS_sites"
+if (file.exists(outDir)){
+  wb <- loadWorkbook(outDir)
+} else {
+  wb <- createWorkbook(outDir)
+}
+removeWorksheet(wb, sheet)
+addWorksheet(wb, sheet)
+writeData(wb, sheet = sheet, x = NSLSites_summExp)
+saveWorkbook(wb, outDir, overwrite = TRUE)
+
+# Proteasome inhibition
+ViolBoxplot(ubiFeatPreds, vars = list(x = "inNLS", y = "BortMG_meanlog2FC", colour = "inNLS"))
+
+
+# Regulation
+sites <- c("P38936_K154", "Q9UBU8_K143")
+omicsCondsLst <- extractOmicsConds(sites, ubnOmicsComp_hsPRIDE_lst)
+omicsCondsDat <- map_dfr(omicsCondsLst, function(x){data.frame("combinedDescUID" = names(x), logFC = x)}, .id = "site")
+omicsCondsDat <- subset(omicsCondsDat, grepl("UV", combinedDescUID))
+## Plot
+ggplot(omicsCondsDat, aes(x = combinedDescUID, y = logFC)) +   
+    geom_hline(yintercept = 0, linewidth = 0.235, colour = "black") +
+    geom_col() + 
+    comfy_theme(rotate_x_text = T, x_text_angle = 90, include_xaxis = F) + 
+    facet_wrap(~site, scale = "free")
+ggsave_pdfpng(file = "output/images/functional_scores/NLS/bar_UV_CDKN1A_MORF4L1", width = 3, height = 5)
+```
+
+
+## Check presence in subcellular proteomics 
+### Elia et al
+```{r}
+# Load data
+eliaPrtms <- list()
+eliaPrtms$nucl <- read_xls(path = paste0(home_directory, "data/supplementary_tables/Elia_MolCell_2015/table_S4.xls"), 
+                            sheet = "DiGly sites in SCX Nuc screens")
+eliaPrtms$cell_UV <- read_xls(path = paste0(home_directory, "data/supplementary_tables/Elia_MolCell_2015/table_S2.xls"), 
+                            sheet = "DiGly sites in UV screen")
+eliaPrtms$cell_IR <- read_xls(path = paste0(home_directory, "data/supplementary_tables/Elia_MolCell_2015/table_S2.xls"), 
+                            sheet = "DiGly sites in IR screen")
+eliaPrtms <- map(eliaPrtms, function(dat){
+    dat$gene_pos <- paste(dat$gene_symbol, dat$site_position, sep = "_")
+    return(dat)
+})
+# Get site lists 
+eliaSites <- list( 
+    nucl = unique(eliaPrtms$nucl$gene_pos),
+    cell = unique(c(eliaPrtms$cell_UV$gene_pos, eliaPrtms$cell_IR$gene_pos))
+)
+ggVennDiagram_nice(eliaSites)
+# Map into feats
+ubiFeatPreds$gene_pos <- paste(ubiFeatPreds$gene, ubiFeatPreds$pos, sep = "_")
+for (name in names(eliaSites)){
+    ubiFeatPreds[, paste0("eliaPresent_", name)] <- ubiFeatPreds$gene_pos %in% eliaSites[[name]]
+}
+table(ubiFeatPreds$eliaPresent_nucl, ubiFeatPreds$eliaPresent_cell)
+
+# Inspect quantification of NLS sites
+ubiFeatPreds$inNLS_and_func <- ubiFeatPreds$inNLS & ubiFeatPreds$functional_score > 0.65
+ubiFeatPreds$inNLS_and_func[which(is.na(ubiFeatPreds$inNLS_and_func))] <- FALSE
+NLSeliaSumm <- ubiFeatPreds %>% 
+# subset(functional_score > 0.65) %>%
+catBoolSummariser(data = ., catCol = "inNLS_and_func",
+                  boolCols = c("eliaPresent_nucl", "eliaPresent_cell")) %>% as.data.frame
+View(NLSeliaSumm)
+subset(ubiFeatPreds, eliaPresent_nucl == T & inNLS == T)$functional_score %>% sort
+
+# Plot enrichment of NLS sites
+NLScolsBar <- setNames(rep(NLSCols[1], 2), c("Nucleus", "Whole-cell"))
+NLSeliaSumm_fPlot <- data.frame("col" = colnames(NLSeliaSumm), "val" = as.numeric(NLSeliaSumm[which(NLSeliaSumm$inNLS_and_func == T), ])) %>% 
+                    subset(col %in% c("inNLS_and_func", "num_rows") == F) %>% 
+                    mutate(colType = strsplit(col, "_") %>% map(~rev(.)[1]) %>% unlist,
+                           compartment = ifelse(grepl("nucl", col), "Nucleus", "Whole-cell")) %>% 
+                    mutate(compartment = factor(compartment, levels = c("Whole-cell", "Nucleus"))) %>%
+                    subset(colType %in% c("num", "enr")) %>% 
+                    dplyr::select(-c("col")) %>%
+                    pivot_wider(names_from = "colType", values_from = "val") %>% 
+                    mutate(log2enr = log2(enr))
+ggplot(NLSeliaSumm_fPlot, aes(x = compartment, y = log2enr, fill = compartment, colour = compartment)) +
+    geom_bar(stat = "identity", width = 0.8, size = 0.235) +
+    geom_text(aes(label = num), vjust = -0.5, color = "black", size = 1.875*6/5) +
+    comfy_theme(include_xaxis = F, rotate_x_text = T, include_legend = F) +
+    theme(axis.title.x = element_blank()) +
+    scale_fill_manual(values = alpha(NLScolsBar, 0.4)) +
+    scale_colour_manual(values = NLScolsBar) +
+    labs(y = "Log2 enrichment") +
+    ggtitle("Detection of functional NLS ubi-sites in subcellular ubi-omics (Elia et al.)")
+ggsave_pdfpng(file = "output/images/functional_scores/NLS/bplot_NLS_elia_enr", 
+                width = 1, height = 1.775)
+```
+
+
+# CPTAC
+## Prep CPTAC ubn-ome data 
+```{r}
+CPTAC_ubi_list <- list()
+```
+
+### LSCC 2021
+```{r}
+#Read in
+CPTAC_ubi_raw <- read_xlsx(paste0(home_directory, "data/supplementary_tables/Satpathy_Cell_2021/Table_S3.xlsx"), sheet = "Table S3L",
+                            skip = 2)
+##Correct identifiers
+colnames(CPTAC_ubi_raw) <- gsub("C3N.", "C3N-", colnames(CPTAC_ubi_raw), fixed = T)   
+colnames(CPTAC_ubi_raw) <- gsub("C3L.", "C3L-", colnames(CPTAC_ubi_raw), fixed = T)  
+#Prep 
+CPTAC_ubi_raw <- CPTAC_ubi_raw %>% 
+            mutate(site = strsplit(id, "_") %>% map(~gsub("[a-z]", "", .[3])) %>% unlist) %>% 
+            mutate(site = gsub(" ", "", site)) %>% 
+            mutate(gene_site = paste(geneSymbol, site, sep = "_")) 
+#Get numerical columns
+CPTAC_ubi_numCols <- colnames(CPTAC_ubi_raw) %>% .[grep("^C3", .)]
+CPTAC_ubi_numColsTum <- CPTAC_ubi_numCols[-grep("N$", CPTAC_ubi_numCols)]
+write.csv(ubiFeatPreds_byGene[, c("gene", "gene_site", "uniprot_site")], file = "output/data/ubiSitesGenes.csv") #Export for TF activity estimation
+
+# Assign to list
+CPTAC_ubi_list$LSCC <- list(
+    "data" = CPTAC_ubi_raw,
+    "CPTAC_ubi_numCols" = CPTAC_ubi_numCols, 
+    "CPTAC_ubi_numColsTum"= CPTAC_ubi_numColsTum
+)
+```
+
+### LUAD 2025
+```{r}
+#Read in
+CPTAC_ubi_raw <- read_xlsx(paste0(home_directory, "data/supplementary_tables/Satpathy_CancerCell_2025/Table_S2.xlsx"), sheet = "S2D_ubiquitylome",
+                            skip = 0)
+##Correct identifiers
+colnames(CPTAC_ubi_raw) <- gsub("C3N.", "C3N-", colnames(CPTAC_ubi_raw), fixed = T)   
+colnames(CPTAC_ubi_raw) <- gsub("C3L.", "C3L-", colnames(CPTAC_ubi_raw), fixed = T)  
+#Prep 
+CPTAC_ubi_raw <- CPTAC_ubi_raw %>% 
+            mutate(site = sites) %>% 
+            mutate(gene_site = paste(geneSymbol, site, sep = "_")) 
+# For the few cases with multiple gene_sites corresponding to missed cleavages, take the highest ReferenceIntensity
+CPTAC_ubi_raw <- CPTAC_ubi_raw %>%
+            group_by(gene_site) %>%
+            slice_max(ReferenceIntensity, n = 1, with_ties = FALSE) %>%
+            ungroup()
+
+#Get numerical columns
+CPTAC_ubi_numCols <- colnames(CPTAC_ubi_raw) %>% .[grep("^C3", .)]
+CPTAC_ubi_numColsTum <- CPTAC_ubi_numCols[-grep("N$", CPTAC_ubi_numCols)]
+
+# Assign to list
+CPTAC_ubi_list$LUAD <- list(
+    "data" = CPTAC_ubi_raw,
+    "CPTAC_ubi_numCols" = CPTAC_ubi_numCols, 
+    "CPTAC_ubi_numColsTum"= CPTAC_ubi_numColsTum
+)
+```
+
+### Combine
+```{r}
+# Overview
+map(CPTAC_ubi_list, ~.$CPTAC_ubi_numColsTum)
+map(CPTAC_ubi_list, ~nrow(.$data))
+
+# Combine
+CPTAC_ubi_list$combined <- list(
+    "data" = map(CPTAC_ubi_list[c("LSCC", "LUAD")], function(lst){
+        datTrim <- lst$data[, c("gene_site", lst$CPTAC_ubi_numColsTum)]
+        return(datTrim)
+    }) %>% purrr::reduce(function(x, y){full_join(x, y, by = "gene_site")}),
+
+    "CPTAC_ubi_numColsTum" = map(CPTAC_ubi_list[c("LSCC", "LUAD")], function(lst){lst$CPTAC_ubi_numColsTum}) %>% 
+        unlist %>% unique
+)
+```
+
+
+
+## Load CPTAC multi-omics 
+These are generated by scripts/CPTAC/01_CPTAC_assemble.py and scripts/CPTAC/02_CPTAC_activity.R
+```{r}
+#Phospho
+CPTACphos <- read_csv("output/data/CPTAC/phosphoproteomics_merged.csv") %>% as.data.frame
+rownames(CPTACphos) <- CPTACphos$gene_site
+CPTACphos <- CPTACphos[, -1]
+CPTACidentif <- read_csv("output/data/CPTAC/phosphoproteomics_merged_identif.csv") %>% as.data.frame %>% .[, -1]
+
+#Clinical
+CPTACclin <- read_csv("output/data/CPTAC/clin_merged.csv") %>% as.data.frame
+rownames(CPTACclin) <- CPTACclin$Patient_ID
+CPTACclin$hasPhospho <- CPTACclin$Patient_ID %in% colnames(CPTACphos)
+
+#Transcriptome
+CPTACtrans <- read_csv("output/data/CPTAC/transcriptomics_merged.csv") %>% as.data.frame
+CPTACtransIdentif <- CPTACtrans[, c("Name", "Database_ID")] %>% dplyr::rename("gene" = "Name", "ENSG" = "Database_ID")
+rownames(CPTACtrans) <- CPTACtrans$Name
+CPTACtrans <- CPTACtrans[, -c(1, 2)]
+#Proteome
+CPTACprot <- read_csv("output/data/CPTAC/proteomics_merged.csv") %>% as.data.frame
+CPTACprotIdentif <- CPTACprot[, c("Name", "Database_ID")] %>% dplyr::rename("gene" = "Name", "ENSG" = "Database_ID")
+rownames(CPTACprot) <- CPTACprot$Name
+CPTACprot <- CPTACprot[, -c(1, 2)]
+
+#Activity
+TFactivity <- read_csv("output/data/CPTAC/TFactivity_m.csv") %>% as.data.frame
+rownames(TFactivity) <- TFactivity[, 1]
+TFactivity <- TFactivity[, -1]
+KinactivityViper <- read_csv("output/data/CPTAC/kinase_activity_VIPER_m.csv") %>% as.data.frame
+rownames(KinactivityViper) <- KinactivityViper[, 1]
+KinactivityViper <- KinactivityViper[, -1]
+```
+
+
+## Check identifiers agree 
+```{r}
+map(CPTAC_ubi_list, function(lst){
+    cols <- lst$CPTAC_ubi_numColsTum
+    list(
+        "numCols" = length(cols),
+        "numOverlap" = length(intersect(cols, colnames(TFactivity)))
+    )
+})
+```
+
+
+
+## Perform correlation
+```{r}
+#Load correlation/annotation/filtering functions
+source("scripts/CPTAC/03_CPTAC_correlation.R")
+
+#Set up
+activMatLst <- list("kinase" = KinactivityViper, "TF" = TFactivity)
+
+#Run correlation, annotation and filtering for each CPTAC dataset
+CPTAC_corr_results <- map(CPTAC_ubi_list, function(lst){
+    run_CPTAC_correlation_pipeline(
+        CPTAC_ubi_dat = lst$data,
+        CPTAC_ubi_numColsTum = lst$CPTAC_ubi_numColsTum,
+        activMatLst = activMatLst,
+        ubiFeatPreds_byGene = ubiFeatPreds_byGene,
+        CPTACprot = CPTACprot,
+        hotspotSites = hotspotSites
+    )
+})
+
+```
+
+
+## Export
+```{r}
+# Export for supp table
+activCorrResLst_dat <- map_dfr(CPTAC_corr_results$combined$filtered, function(x){x}, .id = "proteinType")
+activCorrResLst_exp <- activCorrResLst_dat
+renameCols <- c(
+    "proteinType" = "Protein type",
+    "functional_score" = "Functional score",
+    "gene_site" = "ubi-site",
+    "r_value" = "Correlation r-value",
+    "p_value_adj" = "Adjusted p-value"
+)
+activCorrResLst_exp <- activCorrResLst_exp[, names(renameCols)] %>% 
+    dplyr::rename(!!setNames(names(renameCols), renameCols))
+outDir = "output/data/functional_scores/SuppTable_predFuncSites.xlsx"
+sheet = "CPTAC_sites"
+if (file.exists(outDir)){
+  wb <- loadWorkbook(outDir)
+} else {
+  wb <- createWorkbook(outDir)
+}
+removeWorksheet(wb, sheet)
+addWorksheet(wb, sheet)
+writeData(wb, sheet = sheet, x = activCorrResLst_exp)
+saveWorkbook(wb, outDir, overwrite = TRUE)
+```
+
+
+# Turnover and occupancy 
+## Load and prep data 
+```{r}
+geo_mean <- function(x){exp(mean(log(x)))}
+#Occupancy
+ubiOccDat <- read_xlsx(paste0(home_directory, "data/supplementary_tables/Prus_Cell_2024/mmc1.xlsx"),
+                        skip = 23) 
+ubiOccDat <- ubiOccDat %>% #Separatea alternative protein IDs
+                        separate_rows(c("Proteins", "Positions.within.Proteins"), sep = ";") %>% 
+                        mutate(uniprot_pos = paste(Proteins, Positions.within.Proteins, sep = "_")) %>% 
+                        group_by(uniprot_pos) %>% summarise(mean_Ub.occupancy = geo_mean(mean_Ub.occupancy)) #There are very few duplicate uniprot_sites, just average them
+nrow(ubiOccDat)
+length(which(ubiOccDat$uniprot_pos %in% ubiFeatPreds$uniprot_pos))
+ubiFeatPreds <- left_join(ubiFeatPreds, ubiOccDat[, c("uniprot_pos", "mean_Ub.occupancy")], by = "uniprot_pos")
+#Turnover
+ubiTurnDat <- read_xlsx(paste0(home_directory, "data/supplementary_tables/Prus_Cell_2024/mmc2.xlsx"),
+                        skip = 72) 
+ubiTurnDat <- ubiTurnDat %>% 
+                        dplyr::rename("half.life.min" = "half.life (min)") %>%
+                        #Separatea alternative protein IDs
+                        separate_rows(c("Proteins", "Positions.within.proteins"), sep = ";") %>% 
+                        mutate(uniprot_pos = paste(Proteins, Positions.within.proteins, sep = "_")) %>% 
+                        group_by(uniprot_pos) %>% summarise(half.life.min = geo_mean(half.life.min)) #There are very few duplicate uniprot_sites, just average them
+nrow(ubiTurnDat)
+length(which(ubiTurnDat$uniprot_pos %in% ubiFeatPreds$uniprot_pos))
+ubiFeatPreds <- left_join(ubiFeatPreds, ubiTurnDat[, c("uniprot_pos", "half.life.min")], by = "uniprot_pos")
+```
+
+
+## Visualise
+```{r} 
+# Bin score
+binBreaks <- funcScoreBreaks
+binN <- length(binBreaks)
+binCols <- brewer.pal(9, "Blues")[(9 - binN + 1):9]
+binDat <- binner(data = subset(ubiFeatPreds, !is.na(functional_score)), 
+                valCol = "functional_score", breakType = "float",
+                bin_breaks = binBreaks)
+
+# Violin plots
+## Occupancy
+bin1median <- subset(binDat, Bin == levels(Bin)[1])$mean_Ub.occupancy %>% median(., na.rm = T)
+binDat %>%
+ViolBoxplot(., vars = list(x = "Bin", y = "mean_Ub.occupancy", colour = "Bin", fill = "Bin"), includeLegend = F) +
+        geom_hline(yintercept = bin1median, linewidth = 0.235, linetype = "dashed")  +
+        scale_colour_manual(values = rep(brewer.pal(9, "Blues")[9], binN)) +
+        scale_fill_manual(values = alpha(funcScoreBinCols, funcScoreFillAlpha)) +
+        scale_y_log10() +
+        labs(x = "Functional score", y = "Ubi-site occupancy") +
+        ggtitle("Occupancy (Prus et al.)")
+ggsave_pdfpng(file = "output/images/functional_scores/OccTurnover/viol_funcScore_occupancy",
+                width = 2, height = 2)
+
+## Turnover
+bin1median <- subset(binDat, Bin == levels(Bin)[1])$half.life.min %>% median(., na.rm = T)
+binDat %>%
+ViolBoxplot(., vars = list(x = "Bin", y = "half.life.min", colour = "Bin", fill = "Bin"), includeLegend = F) +
+        geom_hline(yintercept = bin1median, linewidth = 0.235, linetype = "dashed")  +
+        scale_colour_manual(values = rep(brewer.pal(9, "Blues")[9], binN)) +
+        scale_fill_manual(values = alpha(funcScoreBinCols, funcScoreFillAlpha)) +
+        scale_y_log10() +
+        labs(x = "Functional score", y = "Ubi-site half-life (min)")  +
+        ggtitle("Turnover (Prus et al.)")
+ggsave_pdfpng(file = "output/images/functional_scores/OccTurnover/viol_funcScore_halflife",
+                width = 2, height = 2)
+```
+
+
+
+
+# Clinvar genetic variants
+This is generates by scripts/12_prep_genetic_variants.R
+```{r}
+load("output/data/genetics/clinvarDatSub__2.RData")
+# Subset for missense variants
+clinvarDatSub <- subset(clinvarDatSub, grepl("missense_variant", MC))
+dim(clinvarDatSub)
+length(unique(clinvarDatSub$uniprot_site))
+# Map functinal scores in
+clinvarDatSub <- left_join(clinvarDatSub, ubiFeatPreds[, c("uniprot_site", "functional_score", "funcScoreQuant", "mutR_am_pathogenicity_all", "PSP_reg", "PSP_reg_notProtDeg")], by = "uniprot_site")
+clinvarDatSub <- clinvarDatSub %>% mutate(clinvar_label = factor(clinvar_label, levels = c("Benign", "VUS", "Pathogenic")))
+levels(clinvarDatSub$clinvar_label)[2] <- "Uncertain" 
+View(head(clinvarDatSub))
+
+# Enrichment
+fishers_DE_pathway(background_genes = unique(clinvarDatSub$uniprot_site), 
+                   pathway_genes = subset(clinvarDatSub, clinvar_label == "Pathogenic")$uniprot_site %>% unique,
+                   DE_genes = subset(clinvarDatSub, functional_score > 0.65)$uniprot_site %>% unique)
+
+# Visualise
+## Flag mutations to plot
+mutsToLabel <- c("Q14683/K536R")
+labelDat <- subset(clinvarDatSub, variant_id %in% mutsToLabel) %>% 
+            mutate("uniprot" = gsub("_.+$", "", uniprot_site)) %>%
+            left_join(., distinct(ubiFeatPreds_byGene[, c("uniprot", "gene")]), by = "uniprot") %>% 
+            mutate(mut = strsplit(variant_id, "/") %>% map(~.[2]) %>% unlist) %>%
+            mutate(geneMut = paste(gene, mut, sep = " "))
+## Violin
+clinvarCols <- c("#f7fcfe", "#6badd6", "#203569")
+### FUnctional score
+clinvarDatSub %>%
+ViolBoxplot(., vars = list(x = "clinvar_label", y = "functional_score", colour = "clinvar_label", fill = "clinvar_label"),
+                includeLegend = F) + 
+    geom_point(data = labelDat, aes(x = clinvar_label, y = functional_score),
+               shape = 21, size = 1, stroke = 0.71*0.25, colour = "black", fill = alpha(clinvarCols[3], 0.8), 
+               inherit.aes = F) + 
+    geom_text(data = labelDat, aes(x = clinvar_label, y = functional_score, label = geneMut), 
+              colour = "#3f3f3e", size = 1.875*5/5) +
+    scale_colour_manual(values = rep("#203569", 3)) +
+    scale_fill_manual(values = alpha(clinvarCols, 0.25)) + 
+    labs(x = "Pathogenicity", y = "Functional score") +
+    ggtitle("ClinVar missense variants")
+ggsave_pdfpng(file = "output/images/functional_scores/genetics/viol_clinvar_funcScore",
+                width = 2, height = 2)
+#### Mann-Whitney U-tests vs Benign
+wilcox.test(subset(clinvarDatSub, clinvar_label == "Benign")$functional_score,
+            subset(clinvarDatSub, clinvar_label == "Uncertain")$functional_score)
+wilcox.test(subset(clinvarDatSub, clinvar_label == "Benign")$functional_score,
+            subset(clinvarDatSub, clinvar_label == "Pathogenic")$functional_score)$p.value
+### Score quantile within protein
+clinvarDatSub %>%
+ViolBoxplot(., vars = list(x = "clinvar_label", y = "funcScoreQuant", colour = "clinvar_label", fill = "clinvar_label"),
+                includeLegend = F) + 
+    geom_point(data = labelDat, aes(x = clinvar_label, y = functional_score),
+               shape = 21, size = 1, stroke = 0.71*0.25, colour = "black", fill = alpha(clinvarCols[3], 0.8), 
+               inherit.aes = F) + 
+    geom_text(data = labelDat, aes(x = clinvar_label, y = functional_score, label = geneMut), 
+              colour = "#3f3f3e", size = 1.875*5/5) +
+    scale_colour_manual(values = rep("#203569", 3)) +
+    scale_fill_manual(values = alpha(clinvarCols, 0.25)) + 
+    labs(x = "Pathogenicity", y = "Score percentile within protein") +
+    ggtitle("ClinVar missense variants")
+ggsave_pdfpng(file = "output/images/functional_scores/genetics/viol_clinvar_funcScoreQuant",
+                width = 2, height = 2)
+#### Mann-Whitney U-tests vs Benign
+wilcox.test(subset(clinvarDatSub, clinvar_label == "Benign")$funcScoreQuant,
+            subset(clinvarDatSub, clinvar_label == "Uncertain")$funcScoreQuant)
+wilcox.test(subset(clinvarDatSub, clinvar_label == "Benign")$funcScoreQuant,
+            subset(clinvarDatSub, clinvar_label == "Pathogenic")$funcScoreQuant)
+
+# Collapse at the site level and add to feature data
+clinvarDatSub_coll <- clinvarDatSub %>%
+    group_by(uniprot_site) %>%
+    summarise(across(.cols = colnames(.)[-which(colnames(.) %in% c("uniprot_site"))], ~ paste(., collapse = ";")),  .groups = "drop")
+ubiFeatPreds <- left_join(ubiFeatPreds, clinvarDatSub_coll[, c("uniprot_site", "Amino_acid_change", "clinvar_label", "CLNDN", "CLNREVSTAT", "CLNREVSTAT_STARS")])
+## Flag arginine changes that are pathogenic
+ubiFeatPreds$ArgChangePatho <- ubiFeatPreds$uniprot_site %in% subset(clinvarDatSub, clinvar_label == "Pathogenic" & grepl("Arg", Amino_acid_change))$uniprot_site
+
+# Export for inspection
+subset(ubiFeatPreds, grepl("Pathogenic", clinvar_label)) %>% .[order(.$functional_score, decreasing = T), ] %>% 
+    dplyr::relocate(c("functional_score", "ArgChangePatho", "Amino_acid_change", "BortMG_meanlog2FC", "HotspotNew_bool", "gene", "interface_label", "interaction_id", "PSP_reg", "PSP_reg_ProtDeg")) %>% 
+    write.csv(., file = "output/data/genetics/ClinvarPathogenicSites.csv", na = "")
+```
+
+
+# Lysine base editor screen (Bao et al 2023)
+## Load and prep data
+```{r}
+LysBEdat_raw <- read_xlsx(path = paste0(home_directory, "data/supplementary_tables/Bao_MolCell_2023/Table S2-Day24_Day0_screen results.xlsx"), sheet = "Table S3")
+LysBEdat <- LysBEdat_raw %>% as.data.frame
+
+# Subset for lysines
+LysBEdat <- subset(LysBEdat, type %in% c("Depleted_Lysine", "Enriched_Lysine", "Lysine"))
+LysBEdat$type <- factor(LysBEdat$type, levels = c("Lysine", "Depleted_Lysine", "Enriched_Lysine"))
+LysBEdat$sig <- LysBEdat$type != "Lysine"
+
+# Get site ID
+## Clean up redundant IDs for the same guide
+LysBEdat$aa_id <- strsplit(LysBEdat$aa_id, ";") %>% map(~paste(unique(.), collapse = ";")) %>% unlist
+## Split by aa_id
+LysBEdat_perSite <- separate_rows(LysBEdat, "aa_id", sep = ";")
+## Filter for multiple values of type
+multTypeSites <- LysBEdat_perSite %>%
+    group_by(aa_id) %>%
+    filter(n_distinct(type) > 1)
+multTypeSites %>% .[order(.$aa_id), ] %>% View
+
+# Map into our data
+## Overview
+length(which(ubiFeatPreds$uniprot_pos %in% LysBEdat_perSite$aa_id))
+## Subset their data and add our info
+## This deals with the fact that they have multiple rows per site
+LysBEdat_funcScore <- subset(LysBEdat_perSite, aa_id %in% ubiFeatPreds$uniprot_pos) %>% 
+    left_join(., ubiFeatPreds[, c("uniprot_pos", "functional_score", "funcScoreQuant")] %>% dplyr::rename("aa_id" = "uniprot_pos"), by = "aa_id")
+## How many have phenotypes?
+table(LysBEdat_funcScore$type)
+
+# Collapse to the individual site level
+# When one site has multiple classes, assign in this order: Lysine -> Enriched_Lysine -> Depleted_Lysine 
+LysBEdat_funcScore_sites <- LysBEdat_funcScore[, c("type", "functional_score", "funcScoreQuant", "aa_id")] %>% 
+    .[order(.$type, decreasing = T), ] %>%  # This ensures the ordering above
+    group_by(aa_id) %>% summarise(type = type[1], functional_score = functional_score[1], funcScoreQuant = funcScoreQuant[1]) %>% 
+    ungroup %>% 
+    mutate(typeLabel = factor(type, levels = c("Lysine", "Depleted_Lysine", "Enriched_Lysine"), labels = c("No effect", "Deleterious", "Beneficial")))
+LysBEdat_funcScore_sites$sig <- LysBEdat_funcScore_sites$type != "Lysine"
+LysBEdat_funcScore_sites$uniprot <- gsub("_.+$", "", LysBEdat_funcScore_sites$aa_id)
+## Export
+save(LysBEdat_funcScore_sites, file = "output/data/genetics/LysBEdat_funcScore_sites.RData")
+
+
+# Add to our data
+toAdd <- LysBEdat_funcScore_sites %>% 
+    dplyr::rename("uniprot_pos" = "aa_id", "BE_type" = "type", "BE_typeLabel" = "typeLabel", "BE_sig" = "sig") %>% 
+    dplyr::select(-c("uniprot", "functional_score", "funcScoreQuant"))
+if ("BE_type" %in% colnames(ubiFeatPreds) == F){
+    ubiFeatPreds <- left_join(ubiFeatPreds, toAdd, by = "uniprot_pos") %>% 
+        mutate("BE_tested" = !is.na(BE_type))
+}
+```
+
+## Compare functional scores across phenotype groups
+```{r}
+# Plot
+lysBECols <- c("#f7fcfe", "#6badd6", "#203569")
+## Funcitonal score
+LysBEdat_funcScore_sites %>%
+ViolBoxplot(., vars = list(x = "typeLabel", y = "functional_score", colour = "typeLabel", fill = "typeLabel"),
+                includeLegend = F) + 
+    scale_colour_manual(values = rep("#203569", 3)) +
+    scale_fill_manual(values = alpha(lysBECols, 0.25)) + 
+    labs(x = "Base edit effect on viability", y = "Functional score") +
+    ggtitle("Lys base editor screen")
+ggsave_pdfpng(file = "output/images/functional_scores/Bao_baseEdit/viol_BaoLys_funcScore",
+                width = 1.75, height = 2)
+#### Mann-Whitney U-tests vs No effect
+wilcox.test(subset(LysBEdat_funcScore_sites, typeLabel == "No effect")$functional_score,
+            subset(LysBEdat_funcScore_sites, typeLabel == "Deleterious")$functional_score)
+wilcox.test(subset(LysBEdat_funcScore_sites, typeLabel == "No effect")$functional_score,
+            subset(LysBEdat_funcScore_sites, typeLabel == "Beneficial")$functional_score)
+## Score quantile within proteins
+LysBEdat_funcScore_sites %>%
+ViolBoxplot(., vars = list(x = "typeLabel", y = "funcScoreQuant", colour = "typeLabel", fill = "typeLabel"),
+                includeLegend = F) + 
+    scale_colour_manual(values = rep("#203569", 3)) +
+    scale_fill_manual(values = alpha(lysBECols, 0.25)) + 
+    labs(x = "Base edit effect on viability", y = "Score percentile within protein") +
+    ggtitle("Lys base editor screen")
+ggsave_pdfpng(file = "output/images/functional_scores/Bao_baseEdit/viol_BaoLys_funcScoreQuant",
+                width = 1.75, height = 2)
+#### Mann-Whitney U-tests vs No effect
+wilcox.test(subset(LysBEdat_funcScore_sites, typeLabel == "No effect")$funcScoreQuant,
+            subset(LysBEdat_funcScore_sites, typeLabel == "Deleterious")$funcScoreQuant)
+wilcox.test(subset(LysBEdat_funcScore_sites, typeLabel == "No effect")$funcScoreQuant,
+            subset(LysBEdat_funcScore_sites, typeLabel == "Beneficial")$funcScoreQuant)
+
+```

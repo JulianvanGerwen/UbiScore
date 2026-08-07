@@ -1,0 +1,678 @@
+# Background
+Here I compare ubn omics data to conservation data
+This is a modular notebook containing analyses of how ubiquitin modification rates relate to evolutionary conservation, 
+following initial data preparation in 08_ubnOmicsAnalysis.Rmd.
+
+# Initialise
+```{r}
+library(tidyverse)
+library(purrr)
+library(ggplot2)
+library(ComplexHeatmap)
+library(circlize)
+library(readxl)
+library(openxlsx)
+library(limma)
+
+home_directory <- ""
+source(paste0(home_directory, "scripts/essential_visualisations_JvG.R"))
+source(paste0(home_directory, "scripts/enrichment_analysis_JvG.R"))
+source("scripts/00_objects.R")
+source("scripts/01_general.R")
+source("scripts/03_visualisations.R")
+source("scripts/17_linear_models.R")
+```
+
+## Load dependencies from 08_ubnOmicsAnalysis and elsewhere
+```{r}
+#Load processed omics data with PSP annotations and proteasome inhibitor averages
+load("output/data/ubnOmics/ubnOmicsComp_hsPRIDE_lst__forCons__8.RData")
+
+#Load conservation features
+load("data/features/ubiFeatProc__1.RData")
+```
+
+## Functions
+```{r}
+#Function: Heatmap of box enrichment results
+hmap_boxEnr <- function(data, val = "nlog10p_sign", yaxisName = "combinedDescUID", maxVal = NA,
+                        cluster = FALSE, order_column = NA,
+                        ...){
+  ##Cap values
+  if (!is.na(maxVal)){
+    data[which(data[, val] > maxVal), val] <- maxVal
+    data[which(data[, val] < -maxVal), val] <- -maxVal
+  }
+  ##Prep data
+  plotDatWide <- data[, c("box", yaxisName, "padj", val)] %>%
+    pivot_longer(cols = c("padj", val)) %>%
+    mutate(boxName = paste(box, name, sep = "_")) %>%
+    dplyr::select(-c("box", "name")) %>%
+    pivot_wider(names_from = "boxName", values_from = "value")
+  ##Get columns
+  fc_cols <- colnames(plotDatWide) %>% .[grep(val, .)]
+  p_cols <- colnames(plotDatWide) %>% .[grep("padj$", .)]
+  xnames <- strsplit(fc_cols, "_") %>% map(~.[1]) %>% unlist
+  ##Assign y-axis name
+  plotDatWide <- as.data.frame(plotDatWide)
+  rownames(plotDatWide) <- plotDatWide[, yaxisName]
+  ##Order column
+  if (is.na(order_column)){order_column <- yaxisName}
+  ##Cluster
+  if (cluster){
+    clust_cols <- fc_cols
+  } else {
+    clust_cols <- NULL
+  }
+  ##Plot
+  plt <- fc_sig_heatmap(plotDatWide, 
+                 fc_cols_w_pvals = fc_cols,
+                 pval_cols = p_cols,
+                 x_axis_names = xnames,
+                 order_column = order_column,
+                 yaxis_naming = "keepall",
+                 clust_cols = clust_cols,
+                 ...)
+  return(plt)
+}
+
+# Function: Calculate median of logFCs across several factors and plot
+hmap_FCmed <- function(
+  dat,
+  logFCcol = "log2FC",
+  xCol = "consBox_LysCont",
+  yCol = "protAbundance_log_bins",
+  facetCol = "treatType",
+  maxFC = NULL,
+  showNum = FALSE
+  ){
+  # Summarise data
+  summDat <- dat %>% 
+    .[rowSums(is.na(.[, c(logFCcol, xCol, yCol)])) == 0,  ] %>% 
+    group_by(!!sym(xCol), !!sym(yCol), !!sym(facetCol)) %>% 
+    summarise(log2FC_med = median(!!sym(logFCcol)), num = n()) %>% 
+    ungroup
+  summDat$facetCol <- summDat[, facetCol]
+  # Cap FC values if desired
+  if (!is.null(maxFC)){
+    summDat$log2FC_med[which(summDat$log2FC_med >= maxFC)] <- maxFC
+    summDat$log2FC_med[which(summDat$log2FC_med <= -maxFC)] <- -maxFC
+  }
+  # Plot
+  maxVal <- max(abs(summDat$log2FC_med), na.rm = T)
+  plt <- summDat %>% 
+    ggplot(., aes(x = !!sym(xCol), y = !!sym(yCol), fill = log2FC_med)) + 
+    geom_tile() + 
+    scale_fill_gradientn(colors = rev(brewer.pal(9, "RdBu")), limits = c(-maxVal, maxVal)) +
+    coord_fixed() + comfy_theme(rotate_x_text = T, include_xaxis = F, include_yaxis = F) +
+    facet_wrap(facetCol)
+  if (showNum){
+    plt <- plt + geom_text(aes(label = num), colour = "#7a7a7a", size = 1.875 * 3 / 5)
+  }
+  return(plt)
+}
+
+# Function: Plot box plots for FC data
+# xCol and colourCol are factors that are combined for the x-axis
+# Colour is done in blocks, so colourCol specifies the groups and xCol specifies the order within groups
+box_FCs <- function(
+  dat,
+  logFCcol = "log2FC",
+  xCol = "consBox_LysCont",
+  colourCol = "protAbundance_log_binsLab",
+  yLims = c(-2, 3),
+  hlineInts = c(-1, 0, 1)
+){
+  # Prep data
+  dat <- dat %>% .[rowSums(is.na(.[, c(logFCcol, xCol, colourCol)])) == 0,  ] %>% 
+    as.data.frame
+  ## Combine columns to make one x-axis
+  dat <- dat %>% .[order(.[, colourCol], .[, xCol]), ] %>% 
+    mutate(xFact = paste(!!sym(colourCol), !!sym(xCol), sep = "__")) %>% 
+    mutate(xFact = factor(xFact, levels = unique(xFact)))
+
+  ## Calculate numbers to show above violins
+  dataNums <- dat %>% 
+    group_by(xFact) %>%
+    summarise(num = n(), .groups = "drop")
+  ## Calculate y value for number annotations
+  dataNums$y <- max(yLims) * 0.9
+  
+  # Plot
+  plt <- ggplot(dat, aes(x = xFact, y = !!sym(logFCcol), color = !!sym(colourCol), fill = !!sym(colourCol))) + 
+    geom_boxplot(outlier.shape = NA, size = 0.235, alpha = 0.2, coef = 0, width = 0.7) + 
+    geom_hline(yintercept = hlineInts, size = 0.235, linetype = "dashed", alpha = 0.5) +
+    geom_text(data = dataNums, aes(x = xFact, y = y, label = num),
+                          size = 1.875 * 3 / 5, colour = "black",
+                          position = position_dodge2(width = 0.9),
+                          inherit.aes = F) +
+    comfy_theme(rotate_x_text = T) + 
+    theme(axis.text.x = element_text(colour = "black",size = 5, hjust = 1, vjust = 1, angle = 45),
+          axis.title.x = element_blank()) +
+    lims(y = yLims)
+  return(plt)
+}
+```
+
+# Regulation vs conservation
+## Visualise regulation of each condition at each conservation level
+```{r}
+# Prepare data by pivoting to long and adding conservation
+matrixLong <- ubnOmicsComp_hsPRIDE_lst$matrix %>% as.data.frame 
+  pivCols <- colnames(matrixLong)
+matrixLong <- matrixLong %>%
+    rownames_to_column("uniprot_pos") %>%
+    pivot_longer(cols = pivCols, names_to = "expCond_id", values_to = "log2FC") %>%
+    subset(!is.na(log2FC))
+  #Add metadata
+matrixLong <- left_join(matrixLong, ubnOmicsComp_hsPRIDE_lst$meta, by = "expCond_id") %>%
+    .[order(.$group), ] %>% 
+    mutate(expCond_id = factor(expCond_id, levels = unique(expCond_id))) %>%
+    mutate(combinedDescUID = factor(combinedDescUID, levels = unique(combinedDescUID))) %>%
+    left_join(., ubnOmicsComp_hsPRIDE_lst$identif, by = "uniprot_pos")
+# Add conservation levels
+matrixLong <- left_join(matrixLong, ubiFeatProc[, c("uniprot_pos", "consBox_LysCont")])
+matrixLong <- subset(matrixLong, !is.na(consBox_LysCont))
+```
+
+```{r}
+#Plot distributions
+##Set up colours
+violCols <- c("Level1" = "#2472b6",
+              "Level2" = "#2472b6",
+              "Level3" = "#2472b6",
+              "Level4" = "#2472b6",
+              "Level5" = "#2472b6")
+###Mean +- IQR
+for (expCond_idSel in unique(matrixLong$expCond_id)){
+    desc <- as.character(subset(ubnOmicsComp_hsPRIDE_lst$meta, expCond_id == expCond_idSel)$description)
+    group <- as.character(subset(ubnOmicsComp_hsPRIDE_lst$meta, expCond_id == expCond_idSel)$group)
+
+    matrixLong %>% 
+        subset(expCond_id == expCond_idSel) %>%
+    MeanIQRPlot(., vars = list(x = "consBox_LysCont", y = "log2FC", colour = "consBox_LysCont"), includeLegend = F, pointSize = 3) +
+            geom_hline(yintercept = 0, linewidth = 0.235, linetype = "dashed") +
+    scale_colour_manual(name = "Site group",
+                        values = violCols) +
+    labs(y = "log2 fold change (mean ± sd)") + theme(axis.title.x = element_blank()) +
+    ggtitle(desc)
+    ggsave_pdfpng(file = paste0("output/images/ubnOmics/regVsCons/allCondsPlots/viol_cons_vs_", group, "_", expCond_idSel),
+                    width = 2.1, height = 2.1)
+}
+```
+
+
+## Enrichment of regulation at conservation levels 
+### Gene set test
+```{r}
+#Set up
+quantM <- !is.na(ubnOmicsComp_hsPRIDE_lst$matrix)
+boxes <- as.list(paste0("Level", 1:5))
+names(boxes) <- unlist(boxes)
+enrResMat <- matrix(NA, nrow = length(boxes), ncol = ncol(ubnOmicsComp_hsPRIDE_lst$matrix),
+                 dimnames = list(names(boxes), colnames(ubnOmicsComp_hsPRIDE_lst$matrix)))
+gstResDf <- enrResMat %>% as.data.frame %>% rownames_to_column("box") %>%
+  pivot_longer(cols = colnames(.)[-1], names_to = "expCond_id", values_to = "pval") %>%
+  as.data.frame
+gstResDf$logFC_mean_diff <- NA
+#Run enrichment
+for (i in 1:nrow(gstResDf)){
+  box <- gstResDf$box[i]
+  id <- gstResDf$expCond_id[i]
+  #Get data
+  FCvec <- ubnOmicsComp_hsPRIDE_lst$matrix[, id] %>% .[!is.na(.)]
+  boxSites <- subset(ubiFeatProc, consBox_LysCont %in% box)$uniprot_pos
+  boxSitesSub <- intersect(boxSites, names(FCvec))
+  #Run overrep
+  gstRes <- geneSetTest(index = boxSitesSub, statistics = FCvec, alternative = "either", type = "t")
+  logFC_mean_diff <- mean(FCvec[boxSitesSub]) - mean(FCvec)
+  gstResDf$pval[i] <- gstRes
+  gstResDf$logFC_mean_diff[i] <- logFC_mean_diff
+}
+#Adjust p-values
+gstResDf$padj <- p.adjust(gstResDf$pval, method = "fdr")
+#Add values
+gstResDf$box <- factor(gstResDf$box, levels = names(boxes))
+gstResDf$nlog10p <- -log10(gstResDf$padj)
+gstResDf$sign <- sign(gstResDf$logFC_mean_diff)
+gstResDf$nlog10p_sign <- gstResDf$nlog10p * gstResDf$sign
+
+#Add metadata
+gstResDf <- left_join(gstResDf, ubnOmicsComp_hsPRIDE_lst$meta, by = "expCond_id")
+```
+
+
+### Visualise
+```{r}
+#Plot
+sigConds <- subset(gstResDf, padj < 0.05)$expCond_id %>% unique
+plotDat <- subset(gstResDf, expCond_id %in% sigConds)
+
+hmap_boxEnr(data = plotDat,
+            val = "nlog10p_sign",
+            yaxisName = "combinedDescUID", maxVal = 10,
+            scale_colours_manually = F, mid_colour_threshold = 3,
+            legend_title = "-log10 adj. p (signed)",
+            cluster = T)
+ggsave_pdfpng(file = "output/images/ubnOmics/regVsCons/hmap_boxGST_allsig",
+              width = 10, height = 10)
+
+
+#Aggregate results at the level of groups
+geomean <- function(x){exp(mean(log(x)))}
+gstResDfGroupsumm <- gstResDf %>% group_by(box, group) %>%
+  summarise(nlog10p_sign = mean(nlog10p_sign),
+            padj = geomean(padj)) %>%
+  as.data.frame
+hmap_boxEnr(data = gstResDfGroupsumm,
+            val = "nlog10p_sign",
+            yaxisName = "group", maxVal = 10,
+            scale_colours_manually = T, mid_colour_threshold = 3,
+            legend_title = "-log10 adj. p (signed)",
+            order_column = "Level5_nlog10p_sign") +
+  theme(axis.title.y = element_text(colour = "black", size = 7)) + labs(y = "Condition group") +
+  ggtitle("Averaged within groups")
+ggsave_pdfpng(file = "output/images/ubnOmics/regVsCons/hmap_boxGST_groupMean",
+              width = 3.75, height = 3)
+
+# Just significant (in a consistent direction)
+gstResDfGroupsumm %>% 
+  subset(group %in% unique(group[abs(nlog10p_sign) > -log10(0.05)])) %>%
+hmap_boxEnr(data = .,
+            val = "nlog10p_sign",
+            yaxisName = "group", maxVal = 10,
+            scale_colours_manually = T, mid_colour_threshold = 3,
+            legend_title = "-log10 adj. p (signed)",
+            order_column = "Level5_nlog10p_sign") +
+  theme(axis.title.y = element_text(colour = "black", size = 7)) + labs(y = "Condition group") 
+ggsave_pdfpng(file = "output/images/ubnOmics/regVsCons/hmap_boxGST_groupMean_sig",
+              width = 3.35, height = 2.1)
+```
+
+
+## Proteasome inhibition
+### Prepare data
+This is the normalised and aggregated proteasome inhibition data combined with conservation scores
+```{r}
+#Prep data
+prtsmInhibCols <- c("Bortezomib_meanlog2FC", "MG-132_meanlog2FC", "Epoxomicin_meanlog2FC")
+prtsmInhibDat <- ubnOmicsComp_hsPRIDE_lst$identif %>%
+  pivot_longer(cols = prtsmInhibCols,
+               names_to = "treatType", values_to = "log2FC") %>%
+  mutate(treatType = factor(treatType, levels = prtsmInhibCols)) %>% 
+  left_join(., distinct(ubiFeatProc[, c("uniprot_pos", "consBox_LysCont")]), by = "uniprot_pos")  %>% 
+  mutate(dummy = T) #Dummy column for all sites
+levels(prtsmInhibDat$treatType) <- gsub("_meanlog2FC", "", levels(prtsmInhibDat$treatType))
+prtsmInhibDatComb <- makeCombDat(data = prtsmInhibDat, args = list(
+  "Level1" = list("consBox_LysCont", "Level1"),
+  "Level2" = list("consBox_LysCont", "Level2"),
+  "Level3" = list("consBox_LysCont", "Level3"),
+  "Level4" = list("consBox_LysCont", "Level4"),
+  "Level5" = list("consBox_LysCont", "Level5")
+  )
+)
+```
+
+
+### Plot distributions
+```{r}
+#Plot distributions
+##Set up colours
+violCols <- c("Level1" = "#2472b6",
+              "Level2" = "#2472b6",
+              "Level3" = "#2472b6",
+              "Level4" = "#2472b6",
+              "Level5" = "#2472b6")
+##Plot
+###Violin
+plotLst <- prtsmInhibDatComb %>% split(.$treatType) %>% map(function(dat){
+  treat <- dat$treatType[1]
+  dat %>%
+  subset(abs(log2FC) <= 5) %>% 
+ViolBoxplot(., vars = list(x = "group", y = "log2FC", colour = "group", fill = "group"), 
+            includeLegend = F) +
+  geom_hline(yintercept = 0, size = 0.235, alpha = 0.3, linetype = "dashed") +
+  scale_colour_manual(name = "Site group",
+                    values = violCols) +
+  scale_fill_manual(name = "Site group",
+                    values = alpha(violCols, 0.15)) +
+  labs(y = "Avg. log2FC (vs control)") + theme(axis.title.x = element_blank()) +
+  ggtitle(treat)
+})
+ggarrange(plotlist = plotLst, nrow = 1)
+ggsave_pdfpng(file = "output/images/ubnOmics/regVsCons/viol_prtmsInhib_avgFC_Box",
+            width = 6, height = 2)
+###Mean +- IQR
+plotLst <- prtsmInhibDatComb %>% split(.$treatType) %>% map(function(dat){
+  treat <- dat$treatType[1]
+  dat %>%
+  MeanIQRPlot(., vars = list(x = "group", y = "log2FC", colour = "group"), includeLegend = F, pointSize = 3) +
+        geom_hline(yintercept = 0, linewidth = 0.235, linetype = "dashed") +
+  scale_colour_manual(name = "Site group",
+                    values = violCols) +
+  labs(y = "log2 fold change (mean ± sd)") + theme(axis.title.x = element_blank()) +
+  ggtitle(treat)
+})
+ggarrange(plotlist = plotLst, nrow = 1)
+ggsave_pdfpng(file = "output/images/ubnOmics/regVsCons/meanIQR_prtmsInhib_avgFC_Box",
+            width = 5, height = 1.9)
+```
+
+
+
+# Comparing conservation and regulation to protein/site abundance
+These are potential confounders, so I inspect how they influence protein and site abundance
+## Prep data
+```{r}
+load("data/features/abundDat__1.RData")
+abundDat$uniprot_pos <- gsub("_K", "_", rownames(abundDat))
+abundFeatsLog <- colnames(abundDat) %>% .[grep("log$", .)]
+prtsmInhibDat <- left_join(prtsmInhibDat, abundDat, by = "uniprot_pos")
+```
+
+## Compare conservation to abundance features
+```{r}
+pltLst <- list()
+k <- 1
+treat <- unique(prtsmInhibDat$treatType)[1]
+for (abundVar in abundFeatsLog){
+  subDat <- subset(prtsmInhibDat, treatType == treat & !is.na(consBox_LysCont))
+  plt <- ViolBoxplot(subDat, vars = list(x = "consBox_LysCont", colour = 'consBox_LysCont', y = abundVar)) 
+  pltLst[[k]] <- plt 
+  k <- k + 1
+}
+ggarrange(plotlist = pltLst, nrow = 1, ncol = 3)
+ggsave_pdfpng(file = "output/images/ubnOmics/regVsCons/abundance/viol_abundFeats_consBox", width = 8, height = 2)
+```
+
+## Compare proteasomal regulation to abundance features
+```{r}
+# Set up
+library(viridis)
+colScale <- c(seq(0, 0.25, length.out = 6 + 1)[-1], 
+            seq(0.25, 0.7, length.out = 5 + 1)[-1], 1) 
+hexScale <- scale_fill_gradientn(colours = viridis(10), 
+                        values = rescale(colScale, c(0, 1)), 
+                        limits = c(1, NA), name = "# sites")
+
+# Plot
+hexPltLst <- list()
+pltLst <- list()
+k <- 1 
+for (treat in unique(prtsmInhibDat$treatType)){
+  hexPltLst[[treat]] <- list()
+  for (abundVar in abundFeatsLog){
+    subDat <- subset(prtsmInhibDat, treatType == treat & !is.na(log2FC)) %>% 
+    subset(abs(log2FC) < 10) %>%
+      .[!is.na(.[, abundVar]), ] %>% 
+      as.data.frame
+    plt <- ggplot(subDat, aes(y = log2FC, x = !!sym(abundVar))) +
+              geom_hex(bins = 50) +
+              geom_hline(yintercept = 0, colour = "black", size = 0.235, alpha = 0.5) +
+              geom_smooth(method = "lm", formula = y ~ splines::ns(x, 3), se = TRUE, colour = "red", fill = "red", alpha = 0.15, size = 0.235) +
+              comfy_theme() + hexScale + ggtitle(treat) 
+    pltLst[[k]] <- plt 
+    hexPltLst[[treat]][[abundVar]] <- plt
+    k <- k + 1
+  }
+}
+ggarrange(plotlist = pltLst, nrow = length(abundFeatsLog), ncol = length(abundFeatsLog))
+ggsave_pdfpng(file = "output/images/ubnOmics/regVsCons/abundance/hex_abundFeats_prtsmi", width = 8, height = 6)
+```
+
+Plot with abundance or site quantiles as lines
+```{r}
+for (var in abundFeatsLog){
+  quants <- quantile(prtsmInhibDat[, var], seq(0, 10, len = 11) / 10, na.rm = T)
+  plt <- hexPltLst[["MG-132"]][[var]] + 
+    geom_vline(xintercept = quants, size = 0.235, colour = "red", alpha = 0.5)
+  plot(plt)
+  ggsave_pdfpng(file = paste0("output/images/ubnOmics/regVsCons/abundance/hex_", var,  "_wQuants_MG-132"), width = 3, height = 2)
+}
+```
+
+## Compare conservation to proteasomal regulation, controling for protein abundance
+```{r}
+# Bin protein abundance
+binN <- 10
+prtsmInhibDat$protAbundance_log_bins <- cut_number(prtsmInhibDat$protAbundance_log, binN)
+prtsmInhibDat$protAbundance_log_binsLab <- prtsmInhibDat$protAbundance_log_bins
+levels(prtsmInhibDat$protAbundance_log_binsLab) <- paste0("Abun", 1:binN)
+
+#Boxplot
+# Split by treatments
+lst <- prtsmInhibDat %>% split(.$treatType) %>% map(~subset(., !is.na(protAbundance_log_binsLab)))
+pltLst <- map2(lst, names(lst), function(dat, treat){
+  plt <- box_FCs(
+                dat = dat,
+                logFCcol = "log2FC",
+                xCol = "consBox_LysCont",
+                colourCol = "protAbundance_log_binsLab",
+                yLims = c(-2, 3),
+                hlineInts = c(-1, 0, 1)) + 
+      ggtitle(treat)
+  return(plt)
+})
+ggarrange(plotlist = pltLst, nrow = 3)
+ggsave_pdfpng(file = "output/images/ubnOmics/regVsCons/abundance/box_abundBin_consVsPrtsmi", width = 0.6*binN, height = 2*3)
+
+# Heatmap of medians
+hmap_FCmed(
+  dat = prtsmInhibDat,
+  logFCcol = "log2FC",
+  xCol = "consBox_LysCont",
+  yCol = "protAbundance_log_binsLab",
+  facetCol = "treatType",
+  showNum = T
+  )
+ggsave_pdfpng(file = "output/images/ubnOmics/regVsCons/abundance/hmap_abundBin_consVsPrtsmi", width = 6, height = 4)
+```
+
+
+### Inspect above and below the top x %
+```{r}
+quantSel <- 0.1
+prtsmInhibDat$topAbund <- prtsmInhibDat$protAbundance_log >= quantile(prtsmInhibDat$protAbundance_log, 1 - quantSel, na.rm = T)
+prtsmInhibDat$topAbund <- factor(prtsmInhibDat$topAbund, levels = c(F, T), labels = c(paste0("0BelowTop", 100*quantSel), paste0("1AboveTop", 100*quantSel)))
+
+#Boxplot
+# Split by treatments
+lst <- prtsmInhibDat %>% subset(!is.na(topAbund)) %>% split(.$treatType)
+pltLst <- map2(lst, names(lst), function(dat, treat){
+  plt <- box_FCs(
+                dat = dat,
+                logFCcol = "log2FC",
+                xCol = "consBox_LysCont",
+                colourCol = "topAbund",
+                yLims = c(-2, 3),
+                hlineInts = c(-1, 0, 1)) + 
+      ggtitle(treat)
+  return(plt)
+})
+ggarrange(plotlist = pltLst, nrow = 3)
+ggsave_pdfpng(file = "output/images/ubnOmics/regVsCons/abundance/box_abundTop10_consVsPrtsmi", width = 3, height = 2*3)
+```
+
+
+
+#### Plot mean +- SD plots
+```{r}
+# Prep data
+prtsmInhibDatComb <- makeCombDat(data = prtsmInhibDat, args = list(
+  "Level1" = list("consBox_LysCont", "Level1"),
+  "Level2" = list("consBox_LysCont", "Level2"),
+  "Level3" = list("consBox_LysCont", "Level3"),
+  "Level4" = list("consBox_LysCont", "Level4"),
+  "Level5" = list("consBox_LysCont", "Level5")
+  )
+)
+
+#Plot distributions
+##Set up colours
+violCols <- c("Level1" = "#2472b6",
+              "Level2" = "#2472b6",
+              "Level3" = "#2472b6",
+              "Level4" = "#2472b6",
+              "Level5" = "#2472b6")
+##Plot
+###Mean +- IQR
+plotLst <- prtsmInhibDatComb %>% split(.$treatType) %>% map(function(dat){
+  treat <- dat$treatType[1]
+  dat %>%
+  subset(topAbund == "0BelowTop10") %>%  # Subset for bottom 90% by protein abundance
+  MeanIQRPlot(., vars = list(x = "group", y = "log2FC", colour = "group"), includeLegend = F, pointSize = 3) +
+        geom_hline(yintercept = 0, linewidth = 0.235, linetype = "dashed") +
+  scale_colour_manual(name = "Site group",
+                    values = violCols) +
+  labs(y = "log2 fold change (mean ± sd)") + theme(axis.title.x = element_blank()) +
+  ggtitle(treat)
+})
+ggarrange(plotlist = plotLst, nrow = 1)
+ggsave_pdfpng(file = "output/images/ubnOmics/regVsCons/meanIQR_prtmsInhib_avgFC_Box_bottom90Abun",
+            width = 5, height = 1.9)
+```
+
+
+## Compare conservation to proteasomal regulation, controling for site abundance
+```{r}
+# Bin site abundance
+binN <- 10
+prtsmInhibDat$PSMcounts_log_bins <- cut_number(prtsmInhibDat$PSMcounts_log, binN)
+prtsmInhibDat$PSMcounts_log_binsLab <- prtsmInhibDat$PSMcounts_log_bins
+levels(prtsmInhibDat$PSMcounts_log_binsLab) <- paste0("PSM", 1:binN)
+
+
+#Boxplot
+# Split by treatments
+lst <- prtsmInhibDat %>% split(.$treatType)
+pltLst <- map2(lst, names(lst), function(dat, treat){
+  plt <- box_FCs(
+                dat = dat,
+                logFCcol = "log2FC",
+                xCol = "consBox_LysCont",
+                colourCol = "PSMcounts_log_binsLab",
+                yLims = c(-2, 3),
+                hlineInts = c(-1, 0, 1)) + 
+      ggtitle(treat)
+  return(plt)
+})
+ggarrange(plotlist = pltLst, nrow = 3)
+ggsave_pdfpng(file = "output/images/ubnOmics/regVsCons/abundance/box_sitePSMBin_consVsPrtsmi", width = 0.6*binN, height = 2*3)
+
+# Heatmap of medians
+hmap_FCmed(
+  dat = prtsmInhibDat,
+  logFCcol = "log2FC",
+  xCol = "consBox_LysCont",
+  yCol = "PSMcounts_log_binsLab",
+  facetCol = "treatType",
+  showNum = T
+  )
+ggsave_pdfpng(file = "output/images/ubnOmics/regVsCons/abundance/hmap_sitePSMBin_consVsPrtsmi", width = 6, height = 4)
+
+```
+
+
+## Linear models to quantify the influence of confounders
+### Main: test protein abundance or site abundance as cofounders
+```{r}
+# Run linear models for abundance and PSM counts, additive or interaction, linear and nonlinear
+
+
+coefDatLst <- list()
+j <- 1
+# Either all data or just bottom 90% by protein abundance
+datLst <- list("allData" = prtsmInhibDat, "bottom90Abund" = subset(prtsmInhibDat, topAbund == "0BelowTop10"))
+for (datName in names(datLst)){
+  dat <- datLst[[datName]]
+  for (confCol in c("protAbundance_log", "PSMcounts_log")){
+    for (treat in unique(prtsmInhibDat$treatType)){
+      # Set up dat
+      subDat <- dat %>%
+        subset(treatType == treat) %>%
+        subset(!is.na(consBox_LysCont) & !is.na(log2FC))
+      subDat$confCol <- subDat[[confCol]]
+      subDat$confCol <- scale(subDat$confCol)
+      ## Set base level
+      baseLev <- "Level2"
+      levs <- sort(unique(subDat$consBox_LysCont))
+      subDat$consBox_LysCont <- factor(subDat$consBox_LysCont, levels = c(baseLev, setdiff(levs, baseLev)))
+
+      #Linear effects
+      lmBase <- lm(log2FC ~ consBox_LysCont, data = subDat)
+      lmAdd <- lm(log2FC ~ consBox_LysCont + confCol, data = subDat)
+      lmInt <- lm(log2FC ~ consBox_LysCont * confCol, data = subDat)
+      #Non-linear effects
+      gamBase <- gam(log2FC ~ consBox_LysCont, data = subDat)
+      gamAdd <- gam(log2FC ~ consBox_LysCont + s(confCol), data = subDat)
+      gamInt <- gam(log2FC ~ consBox_LysCont + s(confCol, by = consBox_LysCont), 
+                    data = subDat)
+
+
+      # Combine all coefficient tables into one dataframe
+      coefDat <- format_model_coefs(list(lmBase = lmBase, lmAdd = lmAdd, lmInt = lmInt,
+                                          gamBase = gamBase, gamAdd = gamAdd, gamInt = gamInt))
+      coefDat$treatType <- treat
+      coefDat$confCol <- confCol
+      coefDat$data <- datName
+      coefDatLst[[j]] <- coefDat
+      j <- j + 1
+    }
+  }
+}
+coefDatComb <- purrr::reduce(coefDatLst, rbind)
+View(coefDatComb)
+```
+
+Export results
+```{r}
+prepModelResults_prtmsi <- function(x){
+  x %>% subset(model %in% c("gamBase", "gamInt") & termType == "main effect") %>% 
+    dplyr::relocate(c("treatType", "confCol")) %>% 
+    dplyr::select(-c("data", "termType")) %>% 
+    mutate(treatType = factor(treatType, levels = c("MG-132", "Bortezomib", "Epoxomicin"))) %>% 
+    .[order(.$treatType, .$confCol), ] %>% 
+    mutate(confCol = ifelse(model == "gamBase", "", confCol)) %>% 
+    mutate(confCol = factor(confCol, levels = c("protAbundance_log", "PSMcounts_log"), labels = c("log10 protein abundance", "log10 peptide PSM counts"))) %>%
+    mutate(model = factor(model, levels = c("gamBase", "gamInt"), labels = c("Base (no confounder)", "Interaction")))  %>%  
+    mutate(term = gsub("consBox_LysCont", "", term)) %>% 
+    distinct %>% 
+    dplyr::rename(
+      "Treatment" = "treatType",
+      "Confounder" = "confCol",
+      "Main effect term" = "term",
+      "Term estimate" = "Estimate"
+    )
+}
+# Base or interaction models for all data
+# Format for audience consumption
+coefDat_mainExp <- subset(coefDatComb, data == "allData") %>% prepModelResults_prtmsi
+# Export
+outDir = "output/data/ubnOmics/regVsCons/SuppTable_consPrstmi_abund_linMods.xlsx"
+sheet = "generalised_additive_models"
+if (file.exists(outDir)){
+  wb <- loadWorkbook(outDir)
+} else {
+  wb <- createWorkbook(outDir)
+}
+removeWorksheet(wb, sheet)
+addWorksheet(wb, sheet)
+writeData(wb, sheet = sheet, x = coefDat_mainExp)
+saveWorkbook(wb, outDir, overwrite = TRUE)
+
+
+# Base or interaction models on bottom 90% by protein abudance
+coefDat_bottom90Exp <- subset(coefDatComb, data == "bottom90Abund") %>% prepModelResults_prtmsi
+# Export
+outDir = "output/data/ubnOmics/regVsCons/SuppTable_consPrstmi_abund_linMods_bottom90protabund.xlsx"
+sheet = "generalised_additive_models"
+if (file.exists(outDir)){
+  wb <- loadWorkbook(outDir)
+} else {
+  wb <- createWorkbook(outDir)
+}
+removeWorksheet(wb, sheet)
+addWorksheet(wb, sheet)
+writeData(wb, sheet = sheet, x = coefDat_bottom90Exp)
+saveWorkbook(wb, outDir, overwrite = TRUE)
+```

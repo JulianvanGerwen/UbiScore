@@ -1,0 +1,475 @@
+# Background
+Here I explore and prepare the ubn proteomics data
+This encompasses site identifications across multiple species, and 
+quantitative data from human
+
+# Initialise
+```{r}
+library(tidyverse)
+library(purrr)
+library(ggplot2)
+library(readxl)
+
+home_directory <- ""
+source(paste0(home_directory, "scripts/essential_visualisations_JvG.R"))
+source("scripts/00_objects.R")
+source("scripts/01_general.R")
+```
+
+
+# Load data and initial tidying
+## Main data
+```{r}
+#Site data
+ubnOmicsSites <- read_csv(file = "data/features/ubnOmics/ensp_site_canonical.csv") %>%
+  dplyr::rename("publication" = "publication...3") %>% 
+  dplyr::select(-c("publication...8")) %>%
+  mutate(enspPos = paste0(ensp, "_", position))
+## Add manual publicationID-experiment maps
+pubExpMap <- read_csv("data/features/ubnOmics/manualMaps/manual_publication_experiment_map.csv")
+for (i in 1:nrow(pubExpMap)){
+  expID <- pubExpMap$experiment_id[i]
+  ubnOmicsSites$publication[which(ubnOmicsSites$experiment == expID)] <- pubExpMap$publication[i]
+}
+
+#Ubn-omics data with quantifications
+ubnOmicsQuant <- read_csv(file = "data/features/ubnOmics/quanty_ubi.csv") %>%
+  dplyr::select(-c("...1", "id...2", "id...9", "peptide_id...18", "id...19", "experiment")) %>%
+  dplyr::rename("peptide_id" = "peptide_id...7",
+                "mystery_id" = "id...14")
+
+
+#Info on conditions
+conditionData <- read_csv(file = "data/features/ubnOmics/conditions.csv", col_types = cols(.default = col_character()))
+conditionData$id <- as.numeric(conditionData$id)
+
+# Worm data
+wormCompsDf <- read_csv("output/data/ubnOmics/wormComps_forConditions.csv") 
+wormExpCondIDs <- paste(wormCompsDf$experiment_id, wormCompsDf$condition_id, sep = "_")
+```
+
+
+
+
+## Tidy conditions
+```{r}
+#Add expCond_id
+ubnOmicsQuant$expCond_id <- paste(ubnOmicsQuant$experiment_id, ubnOmicsQuant$condition_id, sep = "_")
+#Subset condition data for only those in the quantitative data
+ubnOmicsMeta <- conditionData %>% subset(id %in% c(ubnOmicsQuant$condition_id, wormCompsDf$condition_id)) %>% #Map in worm experiments for now
+  dplyr::rename("condition_id" = "id")
+
+# Swap conditions (treatment and control are the wrong way around)
+toSwap <- which(ubnOmicsMeta$swapDecisionFinal == 1)
+tempDesc <- ubnOmicsMeta$description[toSwap]
+ubnOmicsMeta$description[toSwap] <- ubnOmicsMeta$control_description[toSwap]
+ubnOmicsMeta$control_description[toSwap] <- tempDesc
+
+# Make combinedDesc
+ubnOmicsMeta <- ubnOmicsMeta %>%
+  mutate(combinedDesc = paste0(description, "_vs_", control_description, "_time(min)_", time_min))
+```
+
+
+# Make dataset identifiers for all datasets
+```{r}
+# First make experiment metadata
+experiment_metaDat <- ubnOmicsSites %>%
+  group_by(publication, scientific_name, experiment) %>%
+  summarise(row_count = n(), .groups = "drop") 
+
+# Get publication info
+publicationMap <- read_csv(file = "data/features/ubnOmics/publications table.csv")
+##Add to metadata
+experiment_metaDat <- left_join(experiment_metaDat, 
+                               publicationMap[, c("ID", "pubmedID")] %>% dplyr::rename("publication" = "ID") %>%
+                                 mutate(publication = as.numeric(publication)) %>% subset(!is.na(publication)), 
+                               by = "publication")
+experiment_metaDat$hasPMID <- !is.na(experiment_metaDat$pubmedID)
+experiment_metaDat$hasPMID <- factor(experiment_metaDat$hasPMID, levels = c(T, F))
+levels(experiment_metaDat$hasPMID) <- c("published", "unpublished")
+
+# Subset down to dataset level
+dataset_metaDat <- experiment_metaDat %>%
+  select(-experiment) %>%
+  group_by(publication) %>%
+  summarise(across(everything(), ~ if (cur_column() == "row_count") sum(.x, na.rm = TRUE) else first(.x)),
+            .groups = "drop")
+
+# Make dataset ID
+dataset_metaDat <- dataset_metaDat %>% 
+  .[order(.$pubmedID, .$scientific_name, .$hasPMID), ] %>%
+  group_by(scientific_name, hasPMID) %>% 
+  mutate(seq_num = row_number()) %>% 
+  ungroup() %>% 
+  mutate(dataset_ID = paste(hasPMID, scientific_name, seq_num, sep = "_"))
+dataset_metaDat <- dataset_metaDat %>% dplyr::select(-c("seq_num"))
+
+# Map back into experiment_metaDat
+experiment_metaDat <- left_join(experiment_metaDat, dataset_metaDat[, c("publication", "dataset_ID")], by = "publication")
+
+# Add enrichment and acquisition mode (all are diGly and DDA)
+enrAcqMeta <- read_csv("data/features/ubnOmics/publishedEnrichmentMethods.csv")
+enrAcqMeta <- enrAcqMeta %>% dplyr::rename("enrichment" = "Enrichment class", "acquisition" = "Acquisition mode", "pubmedID" = "PMID")
+# Add metadata for published experiments
+experiment_metaDat <- left_join(experiment_metaDat,
+  enrAcqMeta[, c("pubmedID", "enrichment", "acquisition")], by = "pubmedID")
+# Add metadata for unpublished experiments (they are all diGly and DDA)
+unpubInds <- which(experiment_metaDat$hasPMID == "unpublished")
+experiment_metaDat$enrichment[unpubInds] <- "diGly antibody"
+experiment_metaDat$acquisition[unpubInds] <- "DDA"
+
+# Export
+save(dataset_metaDat, file = "output/data/ubnOmics/dataset_metaDat__2.RData")
+```
+
+
+# Prepare quantification data
+## Map site identifiers
+```{r}
+#Map
+ubnOmicsQuantMapped <- subset(ubnOmicsQuant, site_id %in% ubnOmicsSites$site_id)  %>%
+  left_join(., ubnOmicsSites[, c("site_id", "publication", "scientific_name", "enspPos")], by = "site_id")
+#Inspect numbers
+subset(ubnOmicsQuantMapped, !is.na(log2)) %>%
+  split(.$scientific_name) %>% map(function(dat){
+    #dat <- distinct(dat, site_id, .keep_all = T)
+    return(length(unique(dat$enspPos)))
+  })
+```
+
+
+## Process each dataset
+
+Process each dataset (slow)
+```{r}
+ubnOmicsQuantProc_lst <- ubnOmicsQuantMapped %>% split(.$expCond_id) %>% map(function(dat){
+  #Add multiplicity
+  dat$multiplicity <- str_count(dat$peptide_seq, "ub")
+  #Collapse information at the site level
+  #This will average different peptides with the same site, and replciates within the same experiment_condition
+  meanCols <- c("log2")
+  maxCols <- c("localization_score", "max_spectral_count", "spectral_count")
+  collapseCols <- c("peptide_id", "peptide_seq", "multiplicity")
+  firstCols <- setdiff(colnames(dat), c(meanCols, maxCols, collapseCols, "enspPos"))
+  summariseMax <- function(x){
+    x <- x[which(!is.na(x))]
+    if (length(x) == 0){
+      return(NA)
+    } else {
+      return(max(x))
+    }
+  }
+  datColl <- dat %>% group_by(enspPos) %>%
+    summarise(
+      across(all_of(meanCols), ~mean(.x, na.rm = TRUE)),
+      across(all_of(maxCols), ~summariseMax(.x)),
+      across(all_of(collapseCols), ~paste(na.omit(.x), collapse = ";")),
+      across(all_of(firstCols), ~first(na.omit(.x)))
+    ) %>% 
+    as.data.frame
+  return(datColl)
+})
+save(ubnOmicsQuantProc_lst, file = "output/data/ubnOmics/ubnOmicsQuantProc_lst__1.RData")
+```
+
+```{r}
+# Checkpoint
+# load("output/data/ubnOmics/ubnOmicsQuantProc_lst__1.RData")
+```
+
+
+## Make matrix, metadata, and identifier data
+```{r}
+library(data.table)
+#Identifier data
+ubnOmicsComp_identif <- map(ubnOmicsQuantProc_lst, ~.[, c("enspPos", "residue", "scientific_name")]) %>%
+  rbindlist %>% distinct %>% as.data.frame
+#Matrix
+ubnOmicsComp_matrix <- matrix(NA, nrow = nrow(ubnOmicsComp_identif), ncol = length(ubnOmicsQuantProc_lst),
+                              dimnames = list(ubnOmicsComp_identif$enspPos,
+                                              names(ubnOmicsQuantProc_lst)))
+for (i in 1:length(ubnOmicsQuantProc_lst)){
+  dat <- ubnOmicsQuantProc_lst[[i]]
+  ubnOmicsComp_matrix[dat$enspPos, i] <- dat$log2
+}
+#Metadata
+expCond_ids <- c(colnames(ubnOmicsComp_matrix), wormExpCondIDs) #Manually map in worm data
+ubnOmicsComp_meta <- data.frame("expCond_id" = expCond_ids) %>%
+  mutate(experiment_id = strsplit(expCond_id, "_") %>% map(~.[1]) %>% unlist %>% as.numeric,
+         condition_id = strsplit(expCond_id, "_") %>% map(~.[2]) %>% unlist %>% as.numeric) %>%
+  left_join(., ubnOmicsMeta, by = "condition_id")  %>%
+  mutate(combinedDescUID = paste0(combinedDesc, "__", expCond_id))  #Add UID that includes description
+##Add species and publication
+speciesPub <- ubnOmicsSites[, c("experiment", "scientific_name", "publication")] %>% distinct %>% 
+  dplyr::rename("experiment_id" = "experiment")
+ubnOmicsComp_meta <- left_join(ubnOmicsComp_meta, speciesPub, by = "experiment_id") 
+
+#Prep publication info and add to metadata
+publicationMap <- read_csv(file = "data/features/ubnOmics/publications table.csv")
+##Add to metadata
+ubnOmicsComp_meta <- left_join(ubnOmicsComp_meta, 
+                               publicationMap[, c("ID", "pubmedID")] %>% dplyr::rename("publication" = "ID") %>%
+                                 mutate(publication = as.numeric(publication)) %>% subset(!is.na(publication)), 
+                               by = "publication")
+
+# Add in dataset identifier
+ubnOmicsComp_meta <- left_join(ubnOmicsComp_meta, dataset_metaDat[, c("publication", "dataset_ID")], by = "publication")
+```
+
+
+
+## Add in experimental detail for unpublished experiments
+```{r}
+# Load
+experimentDetail <- read_xlsx(path = "output/data/ubnOmics/ubnOmics_unpublished_EXPDETAILS.xlsx", sheet = "ubnOmics_unpublished_forDetails") %>% 
+  dplyr::rename("experiment_description" = "Cell line/Organism", "quant_type" = "quant type") %>% 
+  .[, c("experiment_description", "quant_type", "experiment_id", "condition_id")] %>% 
+  mutate(condition_id = as.numeric(condition_id))
+# Map in
+ubnOmicsComp_meta <- left_join(ubnOmicsComp_meta, experimentDetail, by = c("experiment_id", "condition_id"))
+# Get rid of experimental info for published datasets
+ubnOmicsComp_meta$experiment_description[which(!is.na(ubnOmicsComp_meta$pubmedID))] <- NA
+ubnOmicsComp_meta$quant_type[which(!is.na(ubnOmicsComp_meta$pubmedID))] <- NA
+```
+
+
+
+## Process NAs that have been misprocessed as 0 values
+```{r}
+#Summary
+zeroValSumm <- data.frame(
+  "expCond_id" = colnames(ubnOmicsComp_matrix),
+  "numQuant" = colSums(!is.na(ubnOmicsComp_matrix)),
+  "numZero" = colSums(ubnOmicsComp_matrix == 0, na.rm = T)
+)
+zeroValSumm <- left_join(zeroValSumm, ubnOmicsComp_meta, by = "expCond_id")
+
+zeroValConds <- subset(zeroValSumm, numZero >= 20)$expCond_id
+for (cond in zeroValConds){
+  ubnOmicsComp_matrix[which(ubnOmicsComp_matrix[, cond] == 0), cond] <- NA
+}
+```
+
+
+## Merge biological replicates that are flagged separately
+```{r}
+#Get biological replicates
+ubnOmicsComp_meta <- mutate(ubnOmicsComp_meta, expDesc = paste(experiment_id, combinedDesc, sep = "__"))
+tab <- table(ubnOmicsComp_meta$expDesc)
+biolRepDf <- ubnOmicsComp_meta %>% subset(expDesc %in% names(tab)[which(tab > 1)]) %>%
+  .[order(.$expDesc, .$expCond_id), c("expCond_id", "expDesc", "pubmedID")] 
+
+##Flag conditions to keep
+##I retain the expCond_id identifier from the first one when sorted
+biolRep_expDescs <- unique(biolRepDf$expDesc)
+biolRepDf$keep <- F
+for (x in biolRep_expDescs){
+  inds <- which(biolRepDf$expDesc == x) %>% sort
+  biolRepDf$keep[inds[1]] <- T
+}
+biolRepDf$grouping <- biolRepDf$expDesc # Group replica by expDesc column
+
+#Add some conditions manually
+extraCollapseConds <- list(
+  c("423_1970", "426_1970", "428_1970"),
+  c("427_2110", "428_2110"),
+  c("448_2103", "457_2103", "446_2103"),
+  c("450_2105", "451_2105")
+)
+## Check that they are not already being collapse
+table(unlist(extraCollapseConds) %in% biolRepDf$expCond_id)
+## Get df
+biolRepDf_manual <- ubnOmicsComp_meta %>% 
+  subset(expCond_id %in% unlist(extraCollapseConds)) %>%
+  .[order(.$expDesc, .$expCond_id), c("expCond_id", "expDesc", "pubmedID")] 
+## Flag conditions to keep
+biolRepDf_manual$keep <- F 
+for (x in extraCollapseConds){
+  biolRepDf_manual$keep[which(biolRepDf_manual$expCond_id == x[1])] <- T
+}
+biolRepDf_manual$grouping <- map(biolRepDf_manual$expCond_id, function(x){
+  boolVec <- map(extraCollapseConds, ~(x %in% .)) %>% unlist
+  return(paste0("manualGroup_", which(boolVec == T)))
+}) %>% unlist 
+
+# Combine
+biolRepDf <- rbind(biolRepDf, biolRepDf_manual)
+
+#Average replicates
+for (x in split(biolRepDf, biolRepDf$grouping)){
+  conds <- x$expCond_id
+  condKeep <- x$expCond_id[which(x$keep == T)]
+  if (condKeep %in% colnames(ubnOmicsComp_matrix)){ # Error handling for conditions that are in metadata but not quant data
+    ubnOmicsComp_matrix[, condKeep] <- apply(ubnOmicsComp_matrix[, conds], 1, FUN = "mean", na.rm = T)
+  }
+}
+ubnOmicsComp_matrix <- ubnOmicsComp_matrix[, -which(colnames(ubnOmicsComp_matrix) %in% 
+                                                    subset(biolRepDf, keep == F)$expCond_id)]
+
+
+#Update metadata
+ubnOmicsComp_meta <- subset(ubnOmicsComp_meta, expCond_id %in% subset(biolRepDf, keep == F)$expCond_id == F)
+```
+
+
+## QC and filtering
+```{r}
+#Number of quantified sites per conditions
+##Focus on human
+humanConds <- subset(ubnOmicsComp_meta, scientific_name == "Homo sapiens")$expCond_id
+quantNumsHs <- colSums(!is.na(ubnOmicsComp_matrix[, humanConds]))
+hist(quantNumsHs, breaks = 20)
+sort(quantNumsHs)
+```
+
+Filtering
+```{r}
+# Filter out MRN experiment due to outlier behaviour and incorrect biological signal
+ubnOmicsComp_meta <- subset(ubnOmicsComp_meta, experiment_id != 443)
+ubnOmicsComp_matrix <- ubnOmicsComp_matrix[, intersect(colnames(ubnOmicsComp_matrix), ubnOmicsComp_meta$expCond_id)]
+
+# Filter out arsenite experiment due to insufficient metadata
+ubnOmicsComp_meta <- subset(ubnOmicsComp_meta, experiment_id != 441)
+ubnOmicsComp_matrix <- ubnOmicsComp_matrix[, intersect(colnames(ubnOmicsComp_matrix), ubnOmicsComp_meta$expCond_id)]
+
+#Filter by quantification
+quantNums <- colSums(!is.na(ubnOmicsComp_matrix))
+filtCols <- names(quantNums)[which(quantNums >= 500)]
+##Filter meta data
+ubnOmicsComp_meta_unfilt <- ubnOmicsComp_meta # Retain a dataset without quantificaiton filtering
+ubnOmicsComp_meta <- subset(ubnOmicsComp_meta, expCond_id %in% filtCols) 
+##Filter matrix
+ubnOmicsComp_matrix <- ubnOmicsComp_matrix[, filtCols]
+ubnOmicsComp_matrix <- ubnOmicsComp_matrix[which(rowSums(!is.na(ubnOmicsComp_matrix)) > 0), ] #Remove sites no longer quantified
+##Filter identif data
+ubnOmicsComp_identif <- subset(ubnOmicsComp_identif, enspPos %in% rownames(ubnOmicsComp_matrix))
+```
+
+
+# Export
+```{r}
+ubnOmicsComp_lst <- list(
+  "meta" = ubnOmicsComp_meta,
+  "identif" = ubnOmicsComp_identif,
+  "matrix" = ubnOmicsComp_matrix
+)
+save(ubnOmicsComp_lst, file = "output/data/ubnOmics/ubnOmicsComp_lst__8.RData")
+
+load("output/data/ubnOmics/ubnOmicsComp_lst__8.RData")
+```
+
+## Prepare and export metadata of datasets and sites
+```{r}
+# Start from dataset meta, because this covers all datasets
+experiment_master_metaData <- experiment_metaDat %>% 
+  dplyr::rename("experiment_id" = "experiment")
+
+# Add in condition metadata where possible
+experiment_master_metaData <- full_join(experiment_master_metaData, 
+  ubnOmicsComp_meta_unfilt[, c("experiment_id", setdiff(colnames(ubnOmicsComp_meta_unfilt), colnames(experiment_master_metaData)))], 
+  by = "experiment_id") 
+experiment_master_metaData <- experiment_master_metaData[!(grepl("unpublished", experiment_master_metaData$dataset_ID) & is.na(experiment_master_metaData$experiment_description)), ]
+
+# Save
+save(experiment_master_metaData, file = "output/data/ubnOmics/experiment_master_metaData__3.RData")
+
+# Format and export for supplementary
+## Format
+renameList <- c(
+  "scientific_name" = "Organism",
+  "description" = "Treatment_Description",
+  "time_min" = "Time_Minutes",
+  "control_description" = "Control_Description",
+  "pubmedID" = "PubMed_ID",
+  "dataset_ID" = "Dataset_ID",
+  "experiment_description" = "Experiment description (unpublished data)",
+  "quant_type" = "Quantification method (unpublished data)",
+  "enrichment" = "Enrichment method",
+  "acquisition" = "Acquisition method"
+)
+experiment_master_metaData_Exp <- experiment_master_metaData[, names(renameList)] %>%
+  subset(scientific_name != "Homo sapiens") %>% 
+  dplyr::rename(!!!setNames(names(renameList), renameList)) %>% 
+  distinct 
+
+## Order
+orderDf <- strsplit(unique(experiment_master_metaData_Exp$Dataset_ID), "_") %>% 
+  purrr::reduce(rbind) %>% as.data.frame
+colnames(orderDf) <- c("pub", "species", "num")
+orderDf <- orderDf %>% 
+  mutate(num = as.numeric(num), pub = factor(pub, levels = c("unpublished", "published"))) %>% 
+  .[order(.$pub, .$species, .$num), ] %>% 
+  mutate(Dataset_ID = paste(pub, species, num, sep = "_"))
+experiment_master_metaData_Exp$Dataset_ID <- factor(experiment_master_metaData_Exp$Dataset_ID, levels = orderDf$Dataset_ID)
+experiment_master_metaData_Exp <- experiment_master_metaData_Exp[order(experiment_master_metaData_Exp$Dataset_ID), ]
+
+## Write
+library(openxlsx)
+wb <- createWorkbook()
+addWorksheet(wb, "All_Experiments_nonHs")
+writeData(wb, "All_Experiments_nonHs", experiment_master_metaData_Exp)
+
+saveWorkbook(wb, "output/data/ubnOmics/SuppTable_experimentMaster_meta.xlsx", overwrite = TRUE)
+```
+
+
+# Overview figures
+Number of studies, perturbations, sites, and quantifications
+```{r}
+#For human
+ubnOmicsComp_hs_lst <- ubnOmicsComp_lst
+ubnOmicsComp_hs_lst$meta <- subset(ubnOmicsComp_hs_lst$meta, scientific_name == "Homo sapiens")
+ubnOmicsComp_hs_lst$identif <- subset(ubnOmicsComp_hs_lst$identif, scientific_name == "Homo sapiens")
+ubnOmicsComp_hs_lst$matrix <- ubnOmicsComp_hs_lst$matrix[ubnOmicsComp_hs_lst$identif$enspPos, 
+                                                         ubnOmicsComp_hs_lst$meta$expCond_id]
+
+##Numbers
+print("Publications")
+ubnOmicsComp_hs_lst$meta %>% subset(scientific_name == "Homo sapiens" & !is.na(pubmedID)) %>%
+      .[, "pubmedID"] %>% unique %>% length
+print("Perturbations")
+nrow(ubnOmicsComp_hs_lst$meta)
+print("Quantified sites")
+quantM <- !is.na(ubnOmicsComp_hs_lst$matrix)
+length(which(rowSums(quantM) > 0))
+print("Quantifications")
+print(sum(quantM))
+```
+
+Overview of number of perturbations in different groups
+```{r}
+# Compute fraction of total and cumulative boundaries for each slice
+groupSumm <- ubnOmicsComp_meta %>% group_by(group) %>% summarise(count = n())
+groupSumm <- mutate(groupSumm, group = factor(group, levels = names(omicsTreatColours))) %>% 
+  .[order(.$group), ]
+groupSumm <- groupSumm %>%
+  mutate(fraction = count / sum(count),
+         ymax = cumsum(fraction),
+         ymin = lag(ymax, default = 0))
+
+#Plot
+ggplot(groupSumm, aes(ymax = ymax, ymin = ymin, xmax = 4, xmin = 3, fill = group, colour = group)) +
+  geom_rect(linewidth = 0.235) +
+  coord_polar(theta = "y") +
+  # Place group names around the outside
+  geom_text(
+    x = 4,  # text radius (further out)
+    aes(y = (ymax + ymin) / 2, label = group),
+    size = 1.875*7/5, colour = "#353535"
+  ) +
+  # Place the counts slightly inward
+  geom_text(
+    x = 3.5,  # text radius (slightly in from the outer edge)
+    aes(y = (ymax + ymin) / 2, label = count),
+    size = 1.875*7/5, color = "black"
+  ) +
+  xlim(c(2.5, 4)) + # Limit x so we only see the donut ring (3 to 4)
+  comfy_theme(include_xaxis = F, include_yaxis = F) +
+  theme(axis.title.x = element_blank(), axis.title.y = element_blank(),
+        axis.text.x = element_blank(), axis.text.y = element_blank()) +
+  scale_fill_manual(values = alpha(omicsTreatColours, 0.8), name = "Perturbation") +
+  scale_colour_manual(values = omicsTreatColours, name = "Perturbation")
+ggsave_pdfpng(file = "output/images/ubnOmics/overview/pie_group_nums",
+  width = 3, height = 1.75)
+```

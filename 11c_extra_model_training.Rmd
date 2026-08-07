@@ -1,0 +1,411 @@
+# Background
+In 11_training_models.Rmd, I train the major model used throughout the project.
+Here I train additional models. For instance, I do:
+- Different negative class subsampling
+- Feature ablation
+
+I typically evaluate the models trained here in 12b_iterate_accuracy_and_major_results.Rmd
+
+# Initialise
+```{r}
+library(tidyverse)
+library(purrr)
+library(ggplot2)
+library(caret)
+library(openxlsx)
+
+home_directory <- ""
+source(paste0(home_directory, "scripts/essential_visualisations_JvG.R"))
+source(paste0(home_directory, "scripts/caret_JvG.R"))
+source("scripts/00_objects.R")
+source("scripts/01_general.R")
+source("scripts/02_model_training.R")
+source("scripts/03_visualisations.R")
+```
+
+# Load data
+```{r}
+load("data/functional_scores/datFeats__7.RData")  # Features for all sites, used for final predictions
+load("data/functional_scores/trainDat_preSplit__7.RData")  # Features with "response" - the class column
+```
+
+
+# Retraining 1B: Individual feature ablation
+Here I remove each feature one-by-one and retrain the model
+```{r}
+suffix <- "retrain1BFeatAblate"
+dir.create(paste0("output/data/functional_scores/", suffix))
+resDir <- paste0("output/data/functional_scores/", suffix, "/")
+```
+
+
+## Set up features to use
+```{r}
+finalFeats <- c(
+    "PRIDE_gold", 
+    "FinalBoxProcNum",
+    "HotspotNew_bool", 
+    "mutR_am_pathogenicity_all", 
+    "interface_label", 
+    "NSP_p_q3_H", 
+    "NSP_p_q3_C", 
+    "NSP_rsa", 
+    "NSP_disorder", 
+    "PSP_boolOtherLysMod", 
+    "PSP_numAdj_5",
+    "numQuant_all", 
+    "numReg_notPrtsm", 
+    "UNIPROT_in_region", 
+    "UNIPROT_in_domain"
+  )
+finalFeatsLst <- map(finalFeats, ~setdiff(finalFeats, .))
+names(finalFeatsLst) <- finalFeats
+```
+
+
+## Make train-test split models
+```{r}
+#Use protein stratification, with 5-time repeated 5-fold split
+numReps <- 5
+trainTestforPredSplits <- list()
+trainDat_preSplit_sub <- trainDat_preSplit
+for (j in 1:numReps){
+  splts <- makeFoldsProtstrat(seed = 123 + j, k = 5, data = trainDat_preSplit_sub)
+  names(splts) <- paste0("Rep", j, names(splts))
+  trainTestforPredSplits <- c(trainTestforPredSplits, splts)
+} 
+save(trainTestforPredSplits, file = paste0(resDir, "trainTestforPredSplits__", suffix, ".RData"))
+
+# Subset columns for each model
+trainTestforPredSplits_lst <- map(finalFeatsLst, function(selFeats){
+  lst1 <- map(trainTestforPredSplits, function(lst2){
+    map(lst2, function(dat){
+      dat <- dat[, c(selFeats, "response")]
+      return(dat)
+    })
+  })
+  return(lst1)
+})
+```
+
+
+## Train models and make predictions 
+```{r}
+# Train
+resLst_lst <- map2(trainTestforPredSplits_lst, names(trainTestforPredSplits_lst), function(trainTestSplits_temp, modName){
+  # Get features
+  selFeats <- finalFeatsLst[[modName]]
+  # Train model and get results
+  resLst <- trainAndMakePreds_logreg(
+    trainTestSplits = trainTestSplits_temp,  
+    datFeats = datFeats[, selFeats],
+    seed = 80
+  )
+  return(resLst)
+})
+
+# Export
+map2(resLst_lst, names(resLst_lst), function(resLst, modName){
+  coeffs <- map(resLst$mods, ~.$finalModel$coefficients) 
+  save(coeffs, file = paste0(resDir, "coeffs_", modName, ".RData"))
+  modsPredsTest_df <- resLst$modsPredsTest_df
+  save(modsPredsTest_df, file = paste0(resDir, "modsPredsTest_df_", modName, ".RData"))
+  allPredsDf <- resLst$allPredsDf
+  save(allPredsDf, file = paste0(resDir, "allPredsDf_", modName, ".RData"))
+})
+```
+
+
+
+# Subsampling the negative class at different ratios to positive
+```{r}
+suffix <- "retrain1Csubsamps"
+dir.create(paste0("output/data/functional_scores/", suffix))
+resDir <- paste0("output/data/functional_scores/", suffix, "/")
+```
+
+
+## Set up features to use
+```{r}
+finalFeats <- c(
+    "PRIDE_gold", 
+    "FinalBoxProcNum",
+    "HotspotNew_bool", 
+    "mutR_am_pathogenicity_all", 
+    "interface_label", 
+    "NSP_p_q3_H", 
+    "NSP_p_q3_C", 
+    "NSP_rsa", 
+    "NSP_disorder", 
+    "PSP_boolOtherLysMod", 
+    "PSP_numAdj_5",
+    "numQuant_all", 
+    "numReg_notPrtsm", 
+    "UNIPROT_in_region", 
+    "UNIPROT_in_domain"
+  )
+```
+
+## Make train-test splits
+I  do one five-fold split
+```{r}
+#Use protein stratification, with 5-time repeated 5-fold split
+numReps <- 1
+trainTestforPredSplits <- list()
+trainDat_preSplit_sub <- trainDat_preSplit[, c(finalFeats, "response")]
+for (j in 1:numReps){
+  splts <- makeFoldsProtstrat(seed = 123 + j, k = 5, data = trainDat_preSplit_sub)
+  names(splts) <- paste0("Rep", j, names(splts))
+  trainTestforPredSplits <- c(trainTestforPredSplits, splts)
+} 
+save(trainTestforPredSplits, file = paste0(resDir, "trainTestforPredSplits__", suffix, ".RData"))
+```
+
+## Do subsampling for train-test splits
+```{r}
+subsamp_args <- list(
+  "1x" = list("subsampMult" = 1, "subsampNum" = 10),
+  "5x" = list("subsampMult" = 5, "subsampNum" = 5),
+  "10x" = list("subsampMult" = 10, "subsampNum" = 5),
+  "100x" = list("subsampMult" = 100, "subsampNum" = 5)
+)
+# Make subsamples
+# These are indices that subset trainDat from the corresponding train-test split
+subsamp_lst <- map(subsamp_args, function(args){
+  # Loop over train-test splits
+  subsampsLst <- map(trainTestforPredSplits, function(lst){
+    subsamps <- subsample_negatives(resp = lst$trainDat$response,
+                        subsampSeed = 70,
+                        subsampNum = args$subsampNum,
+                        subsampMult = args$subsampMult,
+                        reorder = TRUE)
+    return(subsamps)
+  })
+  return(subsampsLst)
+})
+# Add arguments for the main model (no subsampling)
+subsamp_lst$noSubsamp <- map(trainTestforPredSplits, function(lst){
+  list("Subsamp1" = 1:nrow(lst$trainDat))
+})
+save(subsamp_lst, file = paste0(resDir, "subsamp_lst__", suffix, ".RData"))
+```
+
+
+## Train models and make predictions 
+Train one subsampling regime at a time to save memory
+```{r}
+trainSeed <- 80
+startTime <- Sys.time()
+# Loop over subsampling and +- class weights
+for (subsamp_name in names(subsamp_lst)){
+  for (useClassWeights in c(T, F)){
+
+    subsampsLst <- subsamp_lst[[subsamp_name]]
+
+    #  subsampsLst <- map(subsampsLst[1], ~.[1])  # Just do one for testing
+
+    # Get train-test splits
+    trainTestSplits_subsamp <- map2(subsampsLst, names(subsampsLst), function(subsamps, sampName){
+      trainTest_native <- trainTestforPredSplits[[sampName]]
+      # Loop over subsamples
+      trainTest_subsamp <- map(subsamps, function(inds){
+        lst <- trainTest_native
+        lst$trainDat <- lst$trainDat[inds, ]
+        return(lst)
+      })
+      names(trainTest_subsamp) <- paste(sampName, names(trainTest_subsamp), sep = "__")
+      return(trainTest_subsamp)
+    })
+    trainTestSplits_subsampUnrav <- purrr::reduce(trainTestSplits_subsamp, function(x, y){c(x, y)})
+
+    # Train with or without class weights
+    if (useClassWeights){
+      modelName <- paste(subsamp_name, "WWeights")
+      mods <- list()
+      for (j in 1:length(trainTestSplits_subsampUnrav)){
+        splt <- trainTestSplits_subsampUnrav[[j]]
+        trainDat <- splt$trainDat
+        # Train logistic regression
+        mod <- modTrain_LogReg_weighted(feats = trainDat[, -which(colnames(trainDat) == "response")], 
+                                                resp = trainDat$response, 
+                                                fitControl = fitControl_CV, seed = trainSeed + j,
+                                                weightFunc = caseWeights_balanced)
+          mods[[j]] <- mod
+      }
+      names(mods) <- names(trainTestSplits_subsampUnrav)
+    } else {
+      modelName <- paste(subsamp_name, "NoWeights")
+      mods <- list()
+      for (j in 1:length(trainTestSplits_subsampUnrav)){
+        splt <- trainTestSplits_subsampUnrav[[j]]
+        trainDat <- splt$trainDat
+        # Train logistic regression
+        mod <- modTrain_LogReg_unweighted(feats = trainDat[, -which(colnames(trainDat) == "response")], 
+                                          resp = trainDat$response, fitControl = fitControl_CV, seed = trainSeed + j)
+        mods[[j]] <- mod
+      }
+      names(mods) <- names(trainTestSplits_subsampUnrav)
+    }
+
+    # Make predictions and get ROC results 
+    resLst <- makePreds_fromMods(
+      mods = mods,  
+      trainTestSplits = trainTestSplits_subsampUnrav,  
+      datFeats = datFeats[, finalFeats],
+      returnAllPredsLst = T
+    )
+    # Export
+    coeffs <- map(mods, ~.$finalModel$coefficients) 
+    save(coeffs, file = paste0(resDir, "coeffs_", modelName, ".RData"))
+    modsPredsTest_df <- resLst$modsPredsTest_df
+    save(modsPredsTest_df, file = paste0(resDir, "modsPredsTest_df_", modelName, ".RData"))
+    allPredsLst <- resLst$allPredsLst
+    save(allPredsLst, file = paste0(resDir, "allPredsLst_", modelName, ".RData"))
+
+  }
+}
+endTime <- Sys.time()
+print(endTime - startTime)
+```
+
+## Train one model on all data
+```{r}
+# Train
+trainSeed <- 80
+modAllDat <- modTrain_LogReg_weighted(feats = trainDat_preSplit_sub[, -which(colnames(trainDat_preSplit_sub) == "response")], 
+                                                resp = trainDat_preSplit_sub$response, 
+                                                fitControl = fitControl_CV, seed = trainSeed + 1,
+                                                weightFunc = caseWeights_balanced)
+# Predict on all data
+predictions <- predict(modAllDat, newdata = datFeats, type = "prob")
+predDf <- data.frame("X1" = predictions[, "X1"], "uniprot_site" = rownames(datFeats))
+# Export
+modelName <- "allDat"
+coeffs <- modAllDat$finalModel$coefficients 
+save(coeffs, file = paste0(resDir, "coeffs_", modelName, ".RData"))
+allPredsDf <- predDf
+save(allPredsDf, file = paste0(resDir, "allPredsDf_", modelName, ".RData"))
+```
+
+
+
+# Retrain with filtered negative classes
+Here I filter the negative class in different ways
+
+## Filter for not regulated in proteomics conditions
+### Generate negative classes
+```{r}
+source("scripts/04b_ubnOmics_filtering.R")
+load("output/data/ubnOmics/ubnOmicsComp_hsPRIDE_lst__forCons__8.RData")
+
+# Define number of regulations at cutoffs
+fracCutoff <- 0.1
+ubnOmics_reg_lst <- classifyRegulatedSites(ubnOmicsComp_hsPRIDE_lst, fracCutoff)
+ubnOmics_reg_dat <- ubnOmics_reg_lst$identif
+regSites <- subset(ubnOmics_reg_dat, numReg_notPrtsm > 0)$uniprot_pos %>% 
+  gsub("_", "_K", .)
+
+# Use this to filter training data
+trainDat_preSplit_filt <- trainDat_preSplit
+removeBool <- trainDat_preSplit_filt$response == "X0" & rownames(trainDat_preSplit_filt) %in% regSites
+trainDat_preSplit_filt <- trainDat_preSplit_filt[!removeBool, ]
+
+# Remove regulations as a column
+trainDat_preSplit_filt <- trainDat_preSplit_filt %>% dplyr::select(-c("numReg_notPrtsm"))
+table(trainDat_preSplit_filt$response)
+```
+
+### Make train-test splits
+```{r}
+#Use protein stratification, with 1-time repeated 5-fold split
+numReps <- 1
+trainTestforPredSplits <- list()
+for (j in 1:numReps){
+  splts <- makeFoldsProtstrat(seed = 123 + j, k = 5, data = trainDat_preSplit_filt)
+  names(splts) <- paste0("Rep", j, names(splts))
+  trainTestforPredSplits <- c(trainTestforPredSplits, splts)
+} 
+save(trainTestforPredSplits, file = paste0("output/data/functional_scores/trainTestforPredSplits__", suffix, ".RData"))
+# Checkpoint
+#load(paste0("output/data/functional_scores/trainTestforPredSplits__", suffix, ".RData"))
+```
+
+### Train models 
+```{r}
+resLst_filt <- trainAndMakePreds_logreg(
+  trainTestSplits = trainTestforPredSplits,  
+  datFeats = datFeats %>% dplyr::select(-c("numReg_notPrtsm")),
+  seed = 80
+)
+coeffs_filt <- map(resLst_filt$mods, ~.$finalModel$coefficients) 
+```
+
+### Inspect results
+```{r}
+# Inspect AUCs
+resLst_filt$AUCdf
+mean(resLst_filt$AUCdf$AUC)
+sd(resLst_filt$AUCdf$AUC)
+
+# Plot coefficients
+bplot_coeffs(coeffs_filt)
+ggsave_pdfpng(file = "output/images/functional_scores/negClassFilt/bplot_featImp_negClassFilt_regNum",
+                width = 2.75, height = 2.25)
+```
+
+
+## Use ClinVar benign as the negative class
+### Set up negative class
+```{r}
+# Load clinvar
+load("output/data/genetics/clinvarDatSub__2.RData")
+clinvarDatSub <- subset(clinvarDatSub, grepl("missense_variant", MC))
+clinvarDatSub <- clinvarDatSub %>% mutate(clinvar_label = factor(clinvar_label, levels = c("Benign", "VUS", "Pathogenic")))
+levels(clinvarDatSub$clinvar_label)[2] <- "Uncertain" 
+# Filter for benign sites
+benignSites <- subset(clinvarDatSub, clinvar_label == "Benign")$uniprot_site
+
+# Use this to filter training data
+trainDat_preSplit_filt <- trainDat_preSplit
+keepBool <- trainDat_preSplit_filt$response == "X1" | rownames(trainDat_preSplit_filt) %in% benignSites
+trainDat_preSplit_filt <- trainDat_preSplit_filt[keepBool, ]
+table(trainDat_preSplit_filt$response)
+```
+
+
+### Make train-test splits
+```{r}
+#Use protein stratification, with 1-time repeated 5-fold split
+numReps <- 1
+trainTestforPredSplits <- list()
+for (j in 1:numReps){
+  splts <- makeFoldsProtstrat(seed = 123 + j, k = 5, data = trainDat_preSplit_filt)
+  names(splts) <- paste0("Rep", j, names(splts))
+  trainTestforPredSplits <- c(trainTestforPredSplits, splts)
+} 
+save(trainTestforPredSplits, file = paste0("output/data/functional_scores/trainTestforPredSplits__", suffix, ".RData"))
+#load(paste0("output/data/functional_scores/trainTestforPredSplits__", suffix, ".RData"))
+```
+
+### Train models 
+```{r}
+resLst_filt <- trainAndMakePreds_logreg(
+  trainTestSplits = trainTestforPredSplits,  
+  datFeats = datFeats,
+  seed = 80
+)
+coeffs_filt <- map(resLst_filt$mods, ~.$finalModel$coefficients) 
+```
+
+### Inspect results
+```{r}
+# Inspect AUCs
+resLst_filt$AUCdf
+mean(resLst_filt$AUCdf$AUC)
+sd(resLst_filt$AUCdf$AUC)
+
+# Plot coefficients
+bplot_coeffs(coeffs_filt)
+ggsave_pdfpng(file = "output/images/functional_scores/negClassFilt/bplot_featImp_negClassFilt_CVbenign",
+                width = 2.75, height = 2.25)
+```

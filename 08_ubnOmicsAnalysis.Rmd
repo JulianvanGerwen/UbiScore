@@ -1,0 +1,636 @@
+# Background
+Here I analysis ubn omics data
+
+# Initialise
+```{r}
+library(tidyverse)
+library(purrr)
+library(ggplot2)
+
+home_directory <- ""
+source(paste0(home_directory, "scripts/essential_visualisations_JvG.R"))
+source(paste0(home_directory, "scripts/enrichment_analysis_JvG.R"))
+source("scripts/00_objects.R")
+source("scripts/01_general.R")
+source("scripts/03_visualisations.R")
+
+load("data/features/ubnOmics/ubnOmicsComp_lst__8.RData")
+ubnOmicsComp_meta <- ubnOmicsComp_lst$meta
+ubnOmicsComp_identif <- ubnOmicsComp_lst$identif
+ubnOmicsComp_matrix <- ubnOmicsComp_lst$matrix
+```
+
+## Set up omics data
+```{r}
+#Subset for human
+ubnOmicsComp_hs_lst <- ubnOmicsComp_lst
+ubnOmicsComp_hs_lst$meta <- subset(ubnOmicsComp_hs_lst$meta, scientific_name == "Homo sapiens")
+ubnOmicsComp_hs_lst$identif <- subset(ubnOmicsComp_hs_lst$identif, scientific_name == "Homo sapiens")
+ubnOmicsComp_hs_lst$matrix <- ubnOmicsComp_hs_lst$matrix[ubnOmicsComp_hs_lst$identif$enspPos, 
+                                                         ubnOmicsComp_hs_lst$meta$expCond_id]
+write.csv(ubnOmicsComp_hs_lst$meta, file = "output/data/ubnOmics/ubnOmicsComp_hs_meta.csv",
+          na = "")
+```
+
+
+### Map to uniprot_pos and PSP
+```{r}
+#Map to uniprot_pos
+load("data/features/ubnOmics/ubnOmicsSites_unipMap_hs__3.RData")
+ubnOmicsSites_unipMap_hs <- ubnOmicsSites_unipMap_hs %>% 
+  mutate(enspPos = gsub("_[A-Z]", "_", IDpos)) %>%
+  distinct(.)
+if ("uniprot_pos" %in% colnames(ubnOmicsComp_hs_lst$identif) == F){
+  ubnOmicsComp_hs_lst$identif <- left_join(ubnOmicsComp_hs_lst$identif,
+                                           ubnOmicsSites_unipMap_hs, by = "enspPos")
+}
+##Filter for unique uniprot_pos
+ubnOmicsComp_hs_lst$identif <- distinct(ubnOmicsComp_hs_lst$identif,
+                                        uniprot_pos, .keep_all = T) %>%
+  subset(!is.na(uniprot_pos))
+##Assign uniprot_pos as names
+ubnOmicsComp_hs_lst$matrix <- ubnOmicsComp_hs_lst$matrix[ubnOmicsComp_hs_lst$identif$enspPos, ]
+rownames(ubnOmicsComp_hs_lst$matrix) <- ubnOmicsComp_hs_lst$identif$uniprot_pos
+rownames(ubnOmicsComp_hs_lst$identif) <- ubnOmicsComp_hs_lst$identif$uniprot_pos
+
+#Map to PSP
+load("data/PSP/PSP_reg_ubCorr__3.RData")
+PSP_reg_ubCorr <- mutate(PSP_reg_ubCorr, uniprot_pos = gsub("_[A-Z]", "_", uniprot_site))
+PSP_reg_ubSub <- subset(PSP_reg_ubCorr, uniprot_pos %in% ubnOmicsComp_hs_lst$identif$uniprot_pos)
+##Split for different functions
+PSP_reg_ub_FUNC <- split_ON_FUNCTION(PSP_reg_ubSub) 
+##Flag in omics data
+protDegSites <- subset(PSP_reg_ub_FUNC, ON_FUNCTION_strp == "protein degradation")$uniprot_pos
+otherFuncSites <- subset(PSP_reg_ub_FUNC, ON_FUNCTION_strp != "protein degradation")$uniprot_pos
+ubnOmicsComp_hs_lst$identif$PSP_reg <- ubnOmicsComp_hs_lst$identif$uniprot_pos %in% PSP_reg_ubSub$uniprot_pos
+ubnOmicsComp_hs_lst$identif$PSP_reg_ProtDeg <- ubnOmicsComp_hs_lst$identif$uniprot_pos %in% protDegSites
+ubnOmicsComp_hs_lst$identif$PSP_reg_otherFunc <- ubnOmicsComp_hs_lst$identif$uniprot_pos %in% otherFuncSites
+ubnOmicsComp_hs_lst$identif$PSP_reg_notProtDeg <- ubnOmicsComp_hs_lst$identif$uniprot_pos %in% setdiff(otherFuncSites, protDegSites)
+ubnOmicsComp_hs_lst$identif$PSP_reg_ProtDegOnly <- ubnOmicsComp_hs_lst$identif$uniprot_pos %in% setdiff(protDegSites, otherFuncSites)
+##Overview
+for (col in colnames(ubnOmicsComp_hs_lst$identif)){
+  if (grepl("PSP", col)){
+    print(col)
+    print(table(ubnOmicsComp_hs_lst$identif[, col]))
+  }
+}
+
+
+#Map to the PRIDE build
+load("data/features/ubiFeatProc__1.RData")
+ubnOmicsComp_hsPRIDE_lst <- ubnOmicsComp_hs_lst
+ubnOmicsComp_hsPRIDE_lst$identif <- subset(ubnOmicsComp_hsPRIDE_lst$identif,
+                                           uniprot_pos %in% ubiFeatProc$uniprot_pos)
+ubnOmicsComp_hsPRIDE_lst$matrix <- ubnOmicsComp_hsPRIDE_lst$matrix[ubnOmicsComp_hsPRIDE_lst$identif$uniprot_pos, ]
+##Overview
+for (col in colnames(ubnOmicsComp_hsPRIDE_lst$identif)){
+  if (grepl("PSP", col)){
+    print(col)
+    print(table(ubnOmicsComp_hsPRIDE_lst$identif[, col]))
+  }
+}
+
+
+#Export
+save(ubnOmicsComp_hsPRIDE_lst, file = "output/data/ubnOmics/ubnOmicsComp_hsPRIDE_lst__8.RData")
+```
+
+
+### Export quantifications for a supp table
+```{r}
+# Pivot matrix to longer
+ubnOmicsComp_hsPRIDE_matrixLong <- ubnOmicsComp_hsPRIDE_lst$matrix %>% as.data.frame %>% 
+  rownames_to_column("uniprot_position") %>% pivot_longer(cols = colnames(ubnOmicsComp_hsPRIDE_lst$matrix), names_to = "condition_id", values_to = "log2FC") %>% 
+  subset(!is.na(log2FC))
+ 
+# Make cleaner experiment description
+ubnOmicsComp_hsPRIDE_lst$meta <- mutate(ubnOmicsComp_hsPRIDE_lst$meta,
+  combinedDescClean = paste0(description, " ", time_min, "min_vs_", control_description)
+) %>% mutate(combinedDescClean = gsub(" NAmin", "", combinedDescClean))
+
+# Export data
+path <- "output/data/ubnOmics/SuppTable_panSpeciesOmics.xlsx"
+library(openxlsx)
+wb <- createWorkbook()
+
+# Meta data
+sheet <- "HumanConditionMeta"
+renameList <- c(
+  "expCond_id" = "condition_id",
+  "combinedDescClean" = "Treatment_vs_Control",
+  "group" = "Condition_group",
+  "dataset_ID" = "Dataset_ID",
+  "pubmedID" = "PubMed_ID"
+)
+metaExp <- ubnOmicsComp_hsPRIDE_lst$meta[, names(renameList)] %>% dplyr::rename(!!!setNames(names(renameList), renameList))
+## Write
+removeWorksheet(wb, sheet)
+addWorksheet(wb, sheet)
+writeData(wb, sheet, metaExp)
+saveWorkbook(wb, path, overwrite = TRUE)
+
+# Identif data
+sheet <- "HumanSiteMeta"
+renameList <- c(
+  "uniprot_pos" = "uniprot_position",
+  "sequence_window" = "position_+-7AA"
+)
+identifExp <- ubnOmicsComp_hsPRIDE_lst$identif[, names(renameList)] %>% dplyr::rename(!!!setNames(names(renameList), renameList))
+## Write
+removeWorksheet(wb, sheet)
+addWorksheet(wb, sheet)
+writeData(wb, sheet, identifExp)
+saveWorkbook(wb, path, overwrite = TRUE)
+
+# Quant data
+sheet <- "HumanQuantifications"
+removeWorksheet(wb, sheet)
+addWorksheet(wb, sheet)
+writeData(wb, sheet, ubnOmicsComp_hsPRIDE_matrixLong)
+saveWorkbook(wb, path, overwrite = TRUE)
+```
+
+
+# Correlation analysis of conditions
+## Run correlation analysis
+```{r}
+#Functions
+library(ComplexHeatmap)
+library(circlize)
+# Function to make colours
+makeHmapGrad <- function(midpoint = 0.5){
+  breaks <- c(-1, -midpoint, 0, midpoint, 1)
+  # Generate evenly spaced points between each consecutive breakpoint
+  num_intervals <- 9  # Same as the original Brewer palette length
+  expanded_breaks <- sort(unique(c(seq(breaks[1], breaks[2], length.out = num_intervals / 4),
+                                   seq(breaks[2], breaks[3], length.out = num_intervals / 4),
+                                   seq(breaks[3], breaks[4], length.out = num_intervals / 4),
+                                   seq(breaks[4], breaks[5], length.out = num_intervals / 4))))
+  # Select colors from the "RdBu" palette, matching the number of expanded breaks
+  palette_colors <- rev(brewer.pal(length(expanded_breaks), "RdBu"))
+  # Make colour ramp
+  ramp <- colorRamp2(expanded_breaks, palette_colors)
+  return(ramp)
+}
+# Function to compute correlation matrix and visualize with heatmap
+correlation_heatmap <- function(mat, annotation_df, annotation_colors, midpoint = 0.5,
+                                numClusters = 5) {
+  # Compute correlation matrix
+  cor_mat <- cor(mat, use = "pairwise.complete.obs")
+  
+  # Perform hierarchical clustering on the columns
+  #dist_mat <- dist(t(mat))
+  dist_mat <- dist(t(cor_mat)) #Do it on correlation matrix instead
+  hc <- hclust(dist_mat)
+  column_order <- hc$order
+  
+  #Get clusters
+  clusters_k <- cutree(hc, k = numClusters)
+  #annotation_df$cluster <- as.character(clusters_k)
+  
+  # Create column annotation
+  ha <- HeatmapAnnotation(
+    df = annotation_df,
+    col = annotation_colors,
+    annotation_legend_param = list(
+      annotation_name_gp = gpar(fontsize = 7),
+      title_gp = gpar(fontsize = 7),
+      labels_gp = gpar(fontsize = 7)
+    )
+  )
+  
+  # Generate heatmap
+  Heatmap(cor_mat, name = "Correlation", 
+          #row_order = column_order, column_order = column_order,
+          cluster_rows = T, cluster_columns = T,
+          clustering_distance_rows = "pearson", clustering_distance_columns = "pearson",
+          top_annotation = ha, 
+          col = makeHmapGrad(midpoint = midpoint),
+          show_row_names = TRUE, show_column_names = FALSE, row_names_gp = gpar(fontsize = 2),
+          show_row_dend = F, show_column_dend = T,
+          heatmap_legend_param = list(title_gp = gpar(fontsize = 7), labels_gp = gpar(fontsize = 7))
+          )
+}
+
+#Pick data
+preCorrMat <- ubnOmicsComp_hsPRIDE_lst$matrix %>% 
+  .[, order(colnames(.))]
+
+#Set up labelling of condition groups
+annotation_df <- ubnOmicsComp_hsPRIDE_lst$meta %>% 
+  subset(expCond_id %in% colnames(preCorrMat)) %>% .[order(.$expCond_id), ] %>% 
+  dplyr::select(c("group"))
+annotation_colors <- list(group = omicsTreatColours)
+
+#Run correlation
+pdf("output/images/ubnOmics/correlation/hmap_condCorr_all.pdf",
+    width = 4.75, height = 3)
+correlation_heatmap(mat = preCorrMat, annotation_df = annotation_df, annotation_colors = annotation_colors,
+                    midpoint = 0.35, numClusters = 10)
+dev.off()
+```
+
+
+## Correlate the same condition across publications
+### Set up treatment subgroups
+```{r}
+# Load in grouping
+metaDatSubgroups <- read_xlsx(path = "output/data/ubnOmics/metaDat_forSubgroups.xlsx", sheet = "data")
+```
+
+### Extract correlations within subgroups
+```{r}
+# Set up 
+subgroups <- metaDatSubgroups %>% subset(!is.na(subgroup)) %>% 
+  .[, c("subgroup", "publication")] %>% distinct %>% 
+  group_by(subgroup) %>% summarise(num = n()) %>% 
+  subset(num > 1)
+subgroups <- unique(subgroups$subgroup)
+
+# Extract correlations
+cor_mat <- cor(preCorrMat, use = "pairwise.complete.obs")
+cor_mat[lower.tri(cor_mat)] <- NA
+cor_mat_long <- cor_mat %>% 
+  as.data.frame %>% 
+  rownames_to_column("row") %>% 
+  pivot_longer(cols = -row, names_to = "col", values_to = "r") %>% 
+  subset(!is.na(r))
+cor_mat_long_subgroups <- map(subgroups, function(sg){
+  metaDatGroup <- subset(metaDatSubgroups, subgroup == sg)
+  cor_mat_long_sub <- subset(cor_mat_long, row %in% metaDatGroup$expCond_id & col %in% metaDatGroup$expCond_id)
+  cor_mat_long_sub <- cor_mat_long_sub %>% 
+    left_join(., dplyr::rename("row" = "expCond_id", "row_pub" = "publication", "row_combinedDescUID" = "combinedDescUID", metaDatGroup[, c("expCond_id", "publication", "combinedDescUID")])) %>% 
+    left_join(., dplyr::rename("col" = "expCond_id", "col_pub" = "publication", "col_combinedDescUID" = "combinedDescUID", metaDatGroup[, c("expCond_id", "publication", "combinedDescUID")])) %>% 
+    mutate(samePub = row_pub == col_pub, sameExp = row == col, subgroup = sg)
+  return(cor_mat_long_sub)
+}) %>% purrr::reduce(rbind) %>% 
+  mutate(samePubLabel = factor(samePub, levels = c(F, T)))
+levels(cor_mat_long_subgroups$samePubLabel) <- c("Different study", "Same study")
+
+# visualise
+## Each side by side
+cor_mat_long_subgroups %>% 
+  subset(!sameExp) %>%
+  ggplot(aes(x = subgroup, y = r, colour = samePubLabel)) +
+  geom_boxplot(position = position_dodge(width = 0.9), outlier.shape = NA, linewidth = 0.235) +
+  geom_point(position = position_dodge(width = 0.9), shape = 16, size = 1, alpha = 0.7) +
+  comfy_theme(rotate_x_text = T)
+## Two panels
+# First, compute counts per facet & subgroup
+counts <- cor_mat_long_subgroups %>% 
+  subset(!sameExp) %>%
+  group_by(samePubLabel, subgroup) %>%
+  summarise(n = n())
+
+cor_mat_long_subgroups %>% 
+  subset(!sameExp) %>%
+  ggplot(aes(x = subgroup, y = r, colour = samePubLabel)) +
+  geom_boxplot(outlier.shape = NA, linewidth = 0.235) +
+  geom_point(shape = 16, size = 1, alpha = 0.5) +
+  geom_text(data = counts, 
+            aes(x = subgroup, y = 1, label = n), 
+            inherit.aes = FALSE, 
+            vjust = -0.5, 
+            size = 1.875) +
+  comfy_theme(rotate_x_text = T) +
+  facet_wrap(~samePubLabel, scales = "free_x") + 
+  labs(y = "Pearson's r") +
+  ggtitle("Correlation of conditions")
+ggsave_pdfpng(file = "output/images/ubnOmics/correlation/box_sameCond_diffStudy", width = 4.5, height = 2.5)
+
+# Summary numbers
+corrMeans <- cor_mat_long_subgroups %>% 
+  subset(!sameExp) %>% 
+  group_by(subgroup, samePubLabel) %>% 
+  summarise(rMean = mean(r))
+corrMeans %>% group_by(samePubLabel) %>% summarise(rMeanTotal = mean(rMean))
+```
+
+
+
+## Viusalise individual correlations
+```{r}
+prefix <- "output/images/ubnOmics/correlation/examples/corrplot_"
+width = 1.75 
+height = 1.75
+#Set up correlations
+corM <- cor(ubnOmicsComp_hsPRIDE_lst$matrix, use = "pairwise.complete.obs")
+corDf <- as.data.frame(corM)
+corDf$Var1 <- rownames(corDf)
+corDfLong <- corDf %>%
+  pivot_longer(cols = -Var1, names_to = "Var2", values_to = "correlation")
+
+# Set up correlator function
+correlator <- function(ubnOmicsLst, cond1, cond2){
+  plotDat <- ubnOmicsLst$matrix[, c(cond1, cond2)] %>%
+    as.data.frame %>%
+    mutate(uniprot_pos = rownames(.))
+    test <- cor.test(plotDat[[cond1]], plotDat[[cond2]], use = "pairwise.complete.obs")
+    return(test)
+}
+
+
+#Pick correlations
+###DNA damage vs proteasome inhib
+corrplotConds(ubnOmicsLst = ubnOmicsComp_hsPRIDE_lst, cond1 = "381_2025", cond2 = "425_1973")  
+ggsave_pdfpng(file = paste0(prefix, "UVprtsm"), width = width, height = height)
+print(correlator(ubnOmicsComp_hsPRIDE_lst, cond1 = "381_2025", cond2 = "425_1973"))
+
+###DNA damage (prtsm inhib bkd) vs proteasome inhib
+corrplotConds(ubnOmicsLst = ubnOmicsComp_hsPRIDE_lst, cond1 = "440_2164", cond2 = "423_1970")
+ggsave_pdfpng(file = paste0(prefix, "UVprtsmbkd_prtsm"), width = width, height = height)
+print(correlator(ubnOmicsComp_hsPRIDE_lst, cond1 = "440_2164", cond2 = "423_1970")$p.value)
+
+###DNA damage vs ER stress
+corrplotConds(ubnOmicsLst = ubnOmicsComp_hsPRIDE_lst, cond1 = "440_2162", cond2 = "436_2136",
+              sites_to_label = c("P23396_214", "P15880_275", "P15880_58"))
+ggsave_pdfpng(file = paste0(prefix, "UV_ERstress"), width = width, height = height)
+print(correlator(ubnOmicsComp_hsPRIDE_lst, cond1 = "440_2162", cond2 = "436_2136")$p.value)
+```
+
+
+
+# Export metadata and annotations for supplementary info
+```{r}
+# Load master metadata
+load("data/features/ubnOmics/experiment_master_metaData__3.RData")
+
+# Subset for quantitative conditions
+metaDat <- experiment_master_metaData %>% subset(expCond_id %in% ubnOmicsComp_hsPRIDE_lst$meta$expCond_id)
+
+# Order
+x1 <- gsub("_.+$", "", metaDat$dataset_ID)
+x2 <- gsub("^.+_", "", metaDat$dataset_ID) %>% as.numeric
+metaDat <- metaDat[order(x1, x2), ] 
+
+# Get summary statistics
+expCond_quants <- data.frame("expCond_id" = colnames(ubnOmicsComp_hsPRIDE_lst$matrix), "numQuant" = colSums(!is.na(ubnOmicsComp_hsPRIDE_lst$matrix)))
+metaDat <- left_join(metaDat, expCond_quants, by = "expCond_id")
+View(metaDat)
+
+# Export condition metadata
+renameList <- c(
+  "description" = "Treatment_Description",
+  "time_min" = "Time_Minutes",
+  "control_description" = "Control_Description",
+  "group" = "Treatment_Group",
+  "pubmedID" = "PubMed_ID",
+  "dataset_ID" = "Dataset_ID",
+  "numQuant" = "Quantified_UbiSites",
+  "experiment_description" = "Experiment description (unpublished data)",
+  "quant_type" = "Quantification method (unpublished data)",
+  "enrichment" = "Enrichment method",
+  "acquisition" = "Acquisition method"
+)
+metaDat_Exp <- metaDat[, names(renameList)] %>%
+  dplyr::rename(!!!setNames(names(renameList), renameList))
+
+# Write to excel for supp table
+library(openxlsx)
+outDir = "output/data/ubnOmics/SuppTable_experimentMaster_meta.xlsx"
+sheet = "Quantitative_Conditions"
+wb <- loadWorkbook(outDir)
+removeWorksheet(wb, sheet)
+addWorksheet(wb, sheet)
+writeData(wb, sheet = sheet, x = metaDat_Exp)
+saveWorkbook(wb, outDir, overwrite = TRUE)
+```
+
+
+
+# Prepare and define regulation under conditions
+## Functions
+```{r}
+#Function: Pivot matrix to long, add metadata, and make psite groups
+matrixToLongAndGrouped <- function(matrix){
+  #Pivot to long
+  matrixLong <- matrix %>% as.data.frame 
+  pivCols <- colnames(matrixLong)
+  matrixLong <- matrixLong %>%
+    rownames_to_column("uniprot_pos") %>%
+    pivot_longer(cols = pivCols, names_to = "expCond_id", values_to = "log2FC") %>%
+    subset(!is.na(log2FC))
+  #Add metadata
+  matrixLong <- left_join(matrixLong, ubnOmicsComp_hsPRIDE_lst$meta, by = "expCond_id") %>%
+    .[order(.$group), ] %>% 
+    mutate(expCond_id = factor(expCond_id, levels = unique(expCond_id))) %>%
+    mutate(combinedDescUID = factor(combinedDescUID, levels = unique(combinedDescUID))) %>%
+    left_join(., ubnOmicsComp_hsPRIDE_lst$identif, by = "uniprot_pos")
+  #Add groups
+  matrixLongGrouped <- matrixLong %>%
+  dplyr::rename("groupCond" = "group") %>%
+  makeCombDat(data = ., args = list(
+  "notReg" = list("PSP_reg", F),
+  "reg" = list("PSP_reg", T),
+  "protDeg" = list("PSP_reg_ProtDeg", T),
+  "notProtDeg" = list("PSP_reg_notProtDeg", T)
+))
+  return(matrixLongGrouped)
+}
+```
+
+
+
+
+## Classify regulated sites
+Using top/bottom x%
+```{r}
+##Using top/bottom x%
+fracCutoff <- 0.05
+lower_cutoff <- apply(ubnOmicsComp_hsPRIDE_lst$matrix, 2, function(x) quantile(x, fracCutoff, na.rm = TRUE))
+upper_cutoff <- apply(ubnOmicsComp_hsPRIDE_lst$matrix, 2, function(x) quantile(x, 1 - fracCutoff, na.rm = TRUE))
+regBoolMLst <- list(
+  "down" = sweep(ubnOmicsComp_hsPRIDE_lst$matrix, 2, lower_cutoff, FUN = "<"),
+  "up" = sweep(ubnOmicsComp_hsPRIDE_lst$matrix, 2, upper_cutoff, FUN = ">")
+)
+regBoolMLst$either <- regBoolMLst$down | regBoolMLst$up
+regBoolMLst <- map(regBoolMLst, function(m){
+  m[is.na(m)] <- F
+  return(m)
+})
+```
+
+```{r}
+#Assign systematically 
+##Make a list of conditions to work with
+condsLst <- list(
+  "all" = ubnOmicsComp_hsPRIDE_lst$meta$expCond_id,
+  "notPrtsm" = subset(ubnOmicsComp_hsPRIDE_lst$meta, group != "Proteasome inhibition")$expCond_id,
+  "Bort" = subset(ubnOmicsComp_hsPRIDE_lst$meta, group == "Proteasome inhibition" &
+                    grepl("Bortezomib", combinedDesc))$expCond_id,
+  "BortMG" = subset(ubnOmicsComp_hsPRIDE_lst$meta, group == "Proteasome inhibition" &
+                    (grepl("Bortezomib", description) |
+                       grepl("MG-132", description)))$expCond_id
+)
+for (grp in unique(ubnOmicsComp_hsPRIDE_lst$meta$group)){
+  conds <- subset(ubnOmicsComp_hsPRIDE_lst$meta, group == grp)$expCond_id
+ condsLst[[grp]] <- conds
+}
+##Get # regulated and fraction regulated
+###Loop over conditions
+for (i in 1:length(condsLst)){
+  name <- names(condsLst)[i]
+  quantNumCol <- paste0("numQuant_", name)
+  ubnOmicsComp_hsPRIDE_lst$identif[, quantNumCol] <- rowSums(!is.na(ubnOmicsComp_hsPRIDE_lst$matrix[ubnOmicsComp_hsPRIDE_lst$identif$uniprot_pos, 
+                                                  intersect(colnames(regBoolMLst[[1]]), condsLst[[i]])]))
+  ###Loop over directions
+  for (j in 1:length(regBoolMLst)){
+    suffix <- paste0("_", names(regBoolMLst)[j])
+    if (suffix == "_either"){suffix <- ""}
+    boolM <- regBoolMLst[[j]]
+    regNumCol <- paste0("numReg_", name, suffix)
+    
+    regFracCol <- paste0("fracReg_", name, suffix)
+    ubnOmicsComp_hsPRIDE_lst$identif[, regNumCol] <- rowSums(boolM[ubnOmicsComp_hsPRIDE_lst$identif$uniprot_pos, 
+                                                                  intersect(colnames(boolM), condsLst[[i]])])
+    ubnOmicsComp_hsPRIDE_lst$identif[, regFracCol] <- ubnOmicsComp_hsPRIDE_lst$identif[, regNumCol] / ubnOmicsComp_hsPRIDE_lst$identif[, quantNumCol] * 100 #Make percentage
+    ubnOmicsComp_hsPRIDE_lst$identif[which(is.na(ubnOmicsComp_hsPRIDE_lst$identif[, regFracCol])), regFracCol] <- 0
+  }
+}
+```
+
+
+## Proteasome inhibitor conditions - Aggregate distributions
+I normalise and aggregate the FC distributions within each proteasome inhibitor type
+```{r}
+# Get doses of epoxomicin in nM
+ubnOmicsComp_hsPRIDE_lst$meta$epoxDose <- sapply(ubnOmicsComp_hsPRIDE_lst$meta$description, function(desc) {
+  if (grepl("^Epoxomicin", desc)) {
+    m <- regexpr("^Epoxomicin\\s+(\\d+(?:\\.\\d+)?)(nm|um)", desc, perl = TRUE)
+    if(m[1] != -1) {
+      dose <- as.numeric(sub("^Epoxomicin\\s+(\\d+(?:\\.\\d+)?)(nm|um).*", "\\1", desc, perl = TRUE))
+      unit <- sub("^Epoxomicin\\s+(\\d+(?:\\.\\d+)?)(nm|um).*", "\\2", desc, perl = TRUE)
+      if(unit == "um") dose <- dose * 1000
+      return(dose)
+    }
+  }
+  return(NA)
+})
+
+#Set up conditions and treatment types
+conds <- subset(ubnOmicsComp_hsPRIDE_lst$meta, group == "Proteasome inhibition")$expCond_id
+treatTypes <- list(
+  "Bortezomib" = subset(ubnOmicsComp_hsPRIDE_lst$meta, group == "Proteasome inhibition" &
+                    grepl("Bortezomib", combinedDesc) & 
+                    !grepl("MLN", combinedDesc))$expCond_id,  # Remove the MLN combo condition because it is not pure Bort treatment
+  "MG-132" = subset(ubnOmicsComp_hsPRIDE_lst$meta, group == "Proteasome inhibition" &
+                    grepl("MG-132", description) )$expCond_id,
+  "Epoxomicin" = subset(ubnOmicsComp_hsPRIDE_lst$meta, group == "Proteasome inhibition" &
+                    epoxDose > 10 &   # Only use high doses of epoxomicin, because lower doses do not have proteome-wide effects
+                    grepl("Epoxomicin", description) 
+                    )$expCond_id
+)
+
+subset(ubnOmicsComp_hsPRIDE_lst$meta, group == "Proteasome inhibition") %>% View
+
+
+#Get matrix and transform
+matrixConds <- ubnOmicsComp_hsPRIDE_lst$matrix[, conds] %>% as.data.frame 
+##Quantile-transform
+normalize_median_iqr <- function(mat) {
+  # Compute medians and IQRs per column
+  col_medians <- apply(mat, 2, median, na.rm = TRUE)
+  col_iqrs <- apply(mat, 2, function(x) IQR(x, na.rm = TRUE))
+
+  # Compute the target median and IQR
+  target_median <- median(col_medians, na.rm = TRUE)
+  target_iqr <- median(col_iqrs, na.rm = TRUE)
+
+  # Normalize each column
+  normalized_mat <- sweep(mat, 2, col_medians, FUN = "-")  # Center by median
+  normalized_mat <- sweep(normalized_mat, 2, col_iqrs / target_iqr, FUN = "/") # Scale by IQR
+  normalized_mat <- sweep(normalized_mat, 2, target_median, FUN = "+")  # Shift to target median
+
+  return(normalized_mat)
+}
+matrixConds <- normalize_median_iqr(matrixConds)
+
+#Pivot to long
+matrixLongConds <- matrixToLongAndGrouped(matrixConds)
+#Group by treatment types
+matrixLongConds$treatType <- NA
+for (i in 1:length(treatTypes)){
+  matrixLongConds$treatType[which(matrixLongConds$expCond_id %in% treatTypes[[i]])] <- names(treatTypes)[i]
+}
+matrixLongConds <- subset(matrixLongConds, !is.na(treatType))
+matrixLongConds$treatType <- factor(matrixLongConds$treatType, levels = names(treatTypes))
+#Average
+condDatAvg <- matrixLongConds %>%
+  group_by(uniprot_pos, group, treatType) %>% 
+  summarise(log2FC = mean(log2FC, na.rm = T))
+prtsmFCagg <-   condDatAvg
+prtsmFCaggWide <- prtsmFCagg %>% .[, c("uniprot_pos", "treatType", "log2FC")] %>% distinct %>%
+  mutate(treatType = paste(treatType, "meanlog2FC", sep = "_")) %>%
+  pivot_wider(names_from = "treatType", values_from = "log2FC")
+#Add to data
+## Remove if already 
+removeCols <- setdiff(colnames(prtsmFCaggWide), "uniprot_pos")
+ubnOmicsComp_hsPRIDE_lst$identif <- ubnOmicsComp_hsPRIDE_lst$identif %>% .[, which(colnames(.) %in% removeCols == F)]
+ubnOmicsComp_hsPRIDE_lst$identif <- left_join(ubnOmicsComp_hsPRIDE_lst$identif, prtsmFCaggWide, by = "uniprot_pos")
+
+#Plot
+condDatAvg %>%
+  subset(group != "reg") %>%
+  subset(abs(log2FC) <= 5) %>% 
+ViolBoxplot(., vars = list(x = "treatType", y = "log2FC", colour = "group", fill = "group")) +
+  geom_hline(yintercept = 0, size = 0.235, alpha = 0.3, linetype = "dashed") +
+  scale_colour_manual(name = "Site group",
+                    labels = c("Unannotated", "Protein deg.", "Other functions"),
+                    values = PSPcoloursLine) +
+  scale_fill_manual(name = "Site group",
+                    labels = c("Unannotated", "Protein deg.", "Other functions"),
+                    values = alpha(PSPcoloursLine, 0.05)) +
+  labs(y = "Avg. log2FC (inhibitor/control)") + theme(axis.title.x = element_blank()) +
+  ggtitle("Proteasome inhibition")
+ggsave_pdfpng(file = "output/images/ubnOmics/PSP/prtsmInhib/viol_avgFC_PSPreg",
+              width = 3.5, height = 2)
+
+#Plot distributions to check normalisation
+matrixLongConds %>%
+  subset(group != "reg") %>%
+ViolBoxplot(., vars = list(x = "expCond_id", y = "log2FC", colour = "group"),
+            violScale = "width") +
+  geom_hline(yintercept = c(-1, 1), size = 0.235, alpha = 0.5, linetype = "dashed") +
+  theme(axis.text.x = element_text(colour = "black",
+                                    size = 7,
+                                    hjust = 1, vjust = 0.5, angle = 90)) 
+```
+
+# Export modified datasets for conservation analysis
+```{r}
+#Export omics data with PSP annotations and proteasome inhibitor averages
+save(ubnOmicsComp_hsPRIDE_lst, file = "output/data/ubnOmics/ubnOmicsComp_hsPRIDE_lst__forCons__8.RData")
+```
+
+
+
+# Export features for model training
+```{r}
+#Get regulation features
+ubnOmicsFeaturesAll <- ubnOmicsComp_hsPRIDE_lst$identif
+
+#Export
+save(ubnOmicsFeaturesAll, file = "output/data/ubnOmics/ubnOmicsFeauresAll__4.RData")
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

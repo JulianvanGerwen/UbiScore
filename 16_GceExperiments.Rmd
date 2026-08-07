@@ -1,0 +1,245 @@
+# Background
+Here I visualise results from the GCE experiments
+
+# Initialise
+```{r}
+library(tidyverse)
+library(purrr)
+library(ggplot2)
+library(ggridges)
+library(readxl)
+library(openxlsx)
+
+home_directory <- ""
+source(paste0(home_directory, "scripts/essential_visualisations_JvG.R"))
+source(paste0(home_directory, "scripts/enrichment_analysis_JvG.R"))
+source("scripts/01_general.R")
+source("scripts/00_objects.R")
+source("scripts/04_ubnOmics.R")
+
+#Load data
+load("data/functional_scores/ubiFeatPreds__7.RData")
+load("data/features/ubnOmics/ubnOmicsFeauresAll__4.RData")
+load("data/features/ubnOmics/ubnOmicsComp_hsPRIDE_lst__8.RData")
+load("data/hotspots/hotspotSites__3.RData")
+
+#Get gene identifiers for our ubi sites
+library(AnnotationDbi)
+library(org.Hs.eg.db)
+collapseFunc <- function(x){
+    x <- unique(x)
+    if (is.na(x[1])){
+        return(NA)
+    } else {
+        return(paste(x, collapse = ";"))
+    }
+}
+geneMap <- AnnotationDbi::select(org.Hs.eg.db, keys = unique(ubiFeatPreds$uniprot), keytype = "UNIPROT",
+                                    columns = c("SYMBOL")) %>% 
+                                group_by(UNIPROT) %>% 
+                                summarise(gene = collapseFunc(SYMBOL))
+ubiFeatPreds <- left_join(ubiFeatPreds, dplyr::rename(geneMap, "uniprot" = "UNIPROT"), by = "uniprot")
+ubiFeatPreds$gene_site <- paste(ubiFeatPreds$gene, ubiFeatPreds$site, sep = "_")
+```
+
+
+# ELAVL1
+## Visualise all predictions on ELAVL1
+```{r}
+ELAVLdat <- subset(ubiFeatPreds, gene == "ELAVL1")
+
+# Select site(s) to label
+labelPos <- c(320)
+ELAVLdat$label <- ELAVLdat$pos %in% labelPos
+
+# Get range to plot
+protLength <- ELAVLdat$proteinLength[1]
+
+# Get domains
+domains <- list(
+    "RRM1" = c(20, 98),
+    "RRM2" = c(106, 186),
+    "RRM3" = c(244, 322)
+)
+# Convert domains list to a data frame for plotting rectangles
+domain_df <- tibble::tibble(
+    domain = names(domains),
+    xmin = sapply(domains, function(x) x[1]),
+    xmax = sapply(domains, function(x) x[2])
+)
+
+# Parameters
+rectHeight = 0.05*1.25*1.25
+
+# Make lollypop plot
+ggplot(ELAVLdat, aes(x = pos, y = functional_score, colour = label, size = label)) +
+    # Background lines
+    geom_hline(yintercept = 0, size = 0.235, alpha = 1) +
+    geom_hline(yintercept = c(0.5, 1), size = 0.235, alpha = 0.3) +
+    # Lollypop
+    geom_segment(aes(x = pos, xend = pos, y = 0, yend = functional_score), size = 0.235, colour = "#353535") +
+    geom_point(shape = 16) +
+    # Background rectangle
+    geom_rect(aes(xmin = 0, xmax = protLength, ymin = -rectHeight, ymax = rectHeight),
+              fill = "#e9e9ea", colour = "#bbbbba", linewidth = 0.235, inherit.aes = FALSE) +
+    # Add rectangles for domains centered around y = 0
+    geom_rect(data = domain_df, 
+              aes(xmin = xmin, xmax = xmax, ymin = -rectHeight, ymax = rectHeight),
+              fill = "#cfcfd1", colour = "#bbbbba", linewidth = 0.235, inherit.aes = FALSE) +
+    # Plot text inside the rectangles with the domain name
+    geom_text(data = domain_df, 
+              aes(x = (xmin + xmax) / 2, y = 0, label = domain),
+              inherit.aes = FALSE, size = 1.875*6/5, vjust = 0.5, hjust = 0.5) +
+    comfy_theme(include_xaxis = T, include_yaxis = F, include_legend = F) + theme(axis.line.x = element_blank()) +
+    # Scale
+    scale_colour_manual(values  = setNames(c(ubiSiteColour, "#69a4c4"), c(T, F))) +
+    scale_size_manual(values  = setNames(c(2.5, 1.5), c(T, F))) +
+    # More elements
+    xlim(c(0, protLength)) +
+    scale_y_continuous(breaks = seq(0, 1, by = 0.5)) +
+    labs(x = "Protein sequence", y = "Ubi-site functional Score") +
+    ggtitle("ELAVL1 (HuR)")
+ggsave_pdfpng(file = "output/images/experiments/ELAVL1/lolly_ELAVL1", width = 2, height = 1.5)
+```
+
+## Visualise regulation of K320 
+```{r}
+omicsSites <- c("Q15717_K320")
+# Set up
+## Get data
+omicsDat <- extractOmicsConds(sites = omicsSites, omicsLst = ubnOmicsComp_hsPRIDE_lst) %>% 
+    map_dfr(function(x){
+        data.frame(logFC = x, combinedDescUID = names(x))
+    }, .id = "uniprot_site")
+## Add metadata
+omicsDat <- left_join(omicsDat, ubnOmicsComp_hsPRIDE_lst$meta, by = "combinedDescUID")
+
+
+# Select conditions to show
+plottingConds <- list(
+    "UV" = c("381_2025", "385_2036", "383_2031", "363_1988"),
+    "Salmonella (30-120min)" = c("446_2193", "447_2193", "446_2103", "447_2103", "448_2103", "457_2103"),
+    "Salmonella (360min)" = c("450_2105", "451_2105"),
+    "Prtsm inhibition" = c("364_1995", "372_2001", "435_2130")
+)
+
+# Subset data 
+selected_data <- omicsDat %>% 
+    filter(uniprot_site == "Q15717_K320" & expCond_id %in% unlist(plottingConds)) %>% 
+    mutate(plotGroup = NA)
+for (i in 1:length(plottingConds)){
+    selected_data$plotGroup[which(selected_data$expCond_id %in% plottingConds[[i]])] <- names(plottingConds)[i]
+}
+selected_data <- subset(selected_data, !is.na(plotGroup)) %>% 
+    mutate(plotGroup = factor(plotGroup, levels = names(plottingConds))) %>% 
+    distinct(logFC, .keep_all = TRUE)
+
+
+# Plot
+# Calculate the mean logFC per group
+mean_data <- selected_data %>% 
+    group_by(plotGroup) %>% 
+    summarise(mean_logFC = mean(logFC, na.rm = TRUE))
+# Plot scatter points and overlay barplot of the mean (from 0 to mean)
+ggplot(selected_data, aes(x = plotGroup, y = logFC)) + 
+    geom_hline(yintercept = 0, linewidth = 0.235) +
+    geom_col(data = mean_data, aes(x = plotGroup, y = mean_logFC), 
+             fill = alpha(ubiSiteColour, 0.3), colour = ubiSiteColour,
+             size = 0.235, width = 0.8, inherit.aes = FALSE) +
+    geom_point(shape = 16, size = 1, alpha = 0.8, colour = ubiSiteColour) + 
+    comfy_theme(rotate_x_text = TRUE, include_xaxis = FALSE) + theme(axis.title.x = element_blank()) +
+    labs(y = "log2 Treatment/Control") + ggtitle("ELAVL1 K320 regulation")
+    ggsave_pdfpng(file = "output/images/experiments/ELAVL1/barPoint_ELAVL1_omics", width = 1.6, height = 2.5)
+```
+
+### Test whether mean logFC differs from zero per group
+```{r}
+# Safe wrapper: returns NULL instead of erroring when there are too few
+# observations (n < 2) or no variance (all values identical)
+safe_t_test <- function(x){
+    x <- x[!is.na(x)]
+    if (length(x) < 2 || sd(x) == 0){
+        return(NULL)
+    }
+    t.test(x)
+}
+
+ttests <- selected_data %>%
+    group_by(plotGroup) %>%
+    summarise(
+        n = n(),
+        mean_logFC = mean(logFC, na.rm = TRUE),
+        t_test = list(safe_t_test(logFC)),
+        .groups = "drop"
+    ) %>%
+    mutate(
+        conf_low = map_dbl(t_test, ~ if (is.null(.x)) NA_real_ else .x$conf.int[1]),
+        conf_high = map_dbl(t_test, ~ if (is.null(.x)) NA_real_ else .x$conf.int[2]),
+        statistic = map_dbl(t_test, ~ if (is.null(.x)) NA_real_ else .x$statistic),
+        p_value = map_dbl(t_test, ~ if (is.null(.x)) NA_real_ else .x$p.value)
+    ) %>%
+    dplyr::select(-t_test)
+```
+
+
+
+
+# RNA binding data 
+## Load and prep data
+```{r}
+# Load data
+RNAbindRaw <- read_csv("data/experiments/KLang/ELAVL/DATE/RNA_binding_data.csv")
+
+# Tidy data: reshape to long format
+data_long <- RNAbindRaw %>%
+    rename(X = nM) %>%
+    pivot_longer(
+        cols = matches("_\\d+$"),
+        names_to = "key",
+        values_to = "Y"
+    ) %>%
+    separate(key, into = c("Group", "Replicate"), sep = "_", remove = TRUE) %>% 
+    mutate(Group = factor(Group, levels = c("wt", "ub")))
+
+# Compute summary statistics: mean and SD at each X within each group
+sumstats <- data_long %>%
+    group_by(Group, X) %>%
+    summarise(
+        meanY = mean(Y, na.rm = TRUE),
+        sdY   = sd(Y, na.rm = TRUE),
+        .groups = "drop"
+    )
+
+# Plot the mean ± SD for each group at each X value
+ggplot(sumstats, aes(x = X, y = meanY, color = Group)) +
+    geom_hline(yintercept = 0, size = 0.235) +
+    geom_errorbar(aes(ymin = meanY - sdY, ymax = meanY + sdY), width = 300, size = 0.235) +
+    geom_point(size = 1.5, shape = 16) +
+    labs(
+        title = "RNA binding of ELAVL1",
+        x = "ELAVL1 conc. (nM)",
+        y = "RNA binding (del anisotropy)",
+        color = "ELAVL1 (244-326)"
+    ) +
+    comfy_theme() + theme(axis.line.x = element_blank()) +
+    scale_colour_manual(values = c("wt" = "#9e9e9e", "ub" = "#2373b6"),
+                        labels = c("Wildtype", "Ub + K320LisoK"))
+ggsave_pdfpng(file = "data/experiments/KLang/ELAVL/DATE/curve_RNAbind",
+                width = 2.9, height = 1.65)
+```
+
+```{r}
+library(ggplot2)
+
+df <- data.frame(
+  x = c("A", "B"),
+  y = c(5, 7),
+  ymin = c(4, 6),
+  ymax = c(6, 8)
+)
+
+ggplot(df, aes(x, y, ymin = ymin, ymax = ymax)) +
+  geom_point() +
+  geom_errorbar(width = 0.2)   # width controls the horizontal caps
+
+```

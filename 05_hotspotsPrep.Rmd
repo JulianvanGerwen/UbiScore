@@ -1,0 +1,1171 @@
+# Background
+Here I prepare data for the hotspot analysis. This involves mapping non-human ubn sites to uniprot identifiers, extracting domains with InterPro API call, and preparing domains for alignment
+
+
+## How to run the analysis 
+- Run up to step 6b in this document. This will map identifiers, extract domains, and prepare them for hotspot analysis
+- Move output from output/data/hotspots/domains/domainsPreAlign and output/data/hotspots/ubnSites_forHotspots to computational cluster
+- Run scripts/hotspot_scripts/02_runMAFFT_for_hotspots.py to align domain sequences
+- Run scripts/hotspot_scripts/03_run_ptm_hotspots.py to run hotspot analysis
+- Move output from output/data/hotspots/hotspotOutput.csv back to local
+- Run steps 7 up to 7b in this document 
+- Move output from output/data/hotspots/domains/representativeStrs/strRep_seqDomain.fasta to the cluster 
+- Run scripts/hotspot_scripts/04_repStrsMAFFT.py to align domain sequences with the representative structure 
+- Run scripts/hotspot_scripts/05_repStrsHotspots.py to run hotspot analysis with the representative structure
+- Move output from output/data/hotspots/domains/representativeStrs back to local 
+- Run steps 8 and beyond in this document
+
+
+# Initialise
+```{r}
+library(tidyverse)
+library(purrr)
+library(ggplot2)
+library(seqinr)
+library(data.table)
+library(UniProt.ws)
+up <- UniProt.ws()
+library(Biostrings)
+
+home_directory <- ""
+source(paste0(home_directory, "scripts/essential_visualisations_JvG.R"))
+source("scripts/00_objects.R")
+source("scripts/01_general.R")
+source("scripts/hotspot_scripts/01_hotspotPrepFns.R")
+```
+
+
+Load in relevant proteomes
+```{r}
+##Function: read in a fasta file of protein sequences and convert them into a data frame
+library(seqinr)
+read_fastaseq <- function(directory){
+  seqs_raw <- read.fasta(directory)
+  seqs <- data.frame("sequence" = map(seqs_raw, ~paste(., collapse = "")) %>% unlist)
+  seqs$sequence <- toupper(seqs$sequence)
+  seqs$uniprotkb <- strsplit(rownames(seqs), "\\|") %>% map(~.[2]) %>% unlist
+  return(seqs)
+}
+##Load proteomes
+uniprotHsIso <- read_fastaseq(paste(home_directory, 
+                                         "data/biol_databases/uniprot/uniprotkb_proteome_UP000005640_2025_02_19.fasta", sep = ""))
+uniprotHsIsoRevi <- read_fastaseq(paste(home_directory, 
+                                         "data/biol_databases/uniprot/uniprotkb_proteome_UP000005640_AND_revi_2025_02_19.fasta", sep = ""))
+```
+
+
+# 1. Map protein identifiers to uniprot
+## Perform mapping
+### Set up
+```{r}
+ubnOmicsSites <- read_csv(file = "data/features/ubnOmics/ensp_site_canonical.csv")
+identifsSpecies <-ubnOmicsSites %>% split(.$scientific_name) %>% map(~unique(.$ensp))
+sampleIdentifs <- ubnOmicsSites %>% split(.$scientific_name) %>% map(~unique(.$ensp)[1:10])
+
+identifMaps <- list()
+```
+
+
+### Map using uniprot API
+```{r}
+##Databases to use
+unipDbSpecies <- list(
+  "Arabidopsis thaliana" = "Araport"
+)
+
+##Extra processing of identifies
+arabIDs <- data.frame("ID" = identifsSpecies$`Arabidopsis thaliana`,
+                      "IDstrp" = gsub("\\..+$", "", identifsSpecies$`Arabidopsis thaliana`))
+
+##Perform mapping
+arabMap <- mapUniProt(
+    from = "Araport",
+    to = "UniProtKB",
+    query = unique(arabIDs$IDstrp)
+)
+
+##Add the .1 back
+arabMapProc <- left_join(
+  dplyr::rename(arabIDs, "From"= "ID"),
+  dplyr::rename(arabMap, "IDstrp" = "From"),
+  by = "IDstrp"
+)
+
+##Assign
+identifMaps$`Arabidopsis thaliana` <- arabMapProc
+```
+
+
+### Map using annotationDBI
+```{r}
+library(AnnotationDbi)
+library(org.Sc.sgd.db)
+identifMaps[["Saccharomyces cerevisiae"]] <- AnnotationDbi::select(org.Sc.sgd.db, 
+                                                                   keys = identifsSpecies[["Saccharomyces cerevisiae"]], keytype = "ORF",
+                                                                   columns = "UNIPROT")
+```
+
+### Use BioMart manually
+```{r}
+#Export
+expSpecies <- c("Caenorhabditis elegans", "Drosophila melanogaster", 
+                "Gallus gallus", 
+                "Mus musculus", "Rattus norvegicus")
+for (spec in expSpecies){
+  dat <- data.frame("identif" = identifsSpecies[[spec]])
+  write_tsv(dat, file = paste0("output/data/hotspots/identifiers/IDs_", spec, ".tsv"),
+            col_names = F)
+}
+#Load back in
+for (spec in expSpecies){
+  identifMaps[[spec]] <- read_delim(paste0("output/data/hotspots/identifiers/output_", spec, ".txt"))
+}
+
+map(identifMaps, nrow)
+names(identifMaps)
+```
+
+
+## Clean results and compare to uniprot proteomes
+### Clean results
+```{r}
+#Functions
+biomartPickUnip <- function(dat){
+  mutate(dat, uniprot = ifelse(!is.na(`UniProtKB/Swiss-Prot ID`), `UniProtKB/Swiss-Prot ID`, `UniProtKB/TrEMBL ID`))
+}
+#Rename and pick identifiers
+identifMaps$`Arabidopsis thaliana` <- identifMaps$`Arabidopsis thaliana` %>% dplyr::rename("uniprot" = "Entry")
+identifMaps$`Saccharomyces cerevisiae` <- identifMaps$`Saccharomyces cerevisiae` %>% dplyr::rename("uniprot" = "UNIPROT", "From" = "ORF")
+identifMaps$`Caenorhabditis elegans` <- identifMaps$`Caenorhabditis elegans` %>% dplyr::rename("From" = "WormBase CDS ID") %>% biomartPickUnip
+identifMaps$`Drosophila melanogaster` <- identifMaps$`Drosophila melanogaster` %>% dplyr::rename("From" = "Protein stable ID") %>% biomartPickUnip
+identifMaps$`Mus musculus` <- identifMaps$`Mus musculus` %>% dplyr::rename("From" = "Protein stable ID") %>% biomartPickUnip
+identifMaps$`Rattus norvegicus` <- identifMaps$`Rattus norvegicus` %>% dplyr::rename("From" = "Protein stable ID") %>% biomartPickUnip
+identifMaps$`Gallus gallus` <- identifMaps$`Gallus gallus` %>% dplyr::rename("From" = "Protein stable ID") %>% biomartPickUnip
+
+#Add C elegans extra results
+celegans_protID <- read_tsv("output/data/hotspots/identifiers/output_PROTEINID_Caenorhabditis elegans.txt") %>%
+  mutate(From = `Protein stable ID`) %>% biomartPickUnip
+identifMaps$`Caenorhabditis elegans` <- rbind(identifMaps$`Caenorhabditis elegans`, celegans_protID)
+
+#export
+save(identifMaps, file = "output/data/hotspots/identifiers/identifMaps__2.RData")
+```
+
+```{r}
+# Checkpoint
+#load("output/data/hotspots/identifiers/identifMaps__2.RData")
+```
+
+
+### Load proteomes
+```{r}
+#Function to load proteomes
+library(seqinr)
+read_fastaseq <- function(directory){
+  seqs_raw <- read.fasta(directory)
+  seqs <- data.frame("sequence" = map(seqs_raw, ~paste(., collapse = "")) %>% unlist)
+  seqs$sequence <- toupper(seqs$sequence)
+  seqs$uniprotkb <- strsplit(rownames(seqs), "\\|") %>% map(~.[2]) %>% unlist
+  return(seqs)
+}
+
+#Set up directories
+proteomeCodes <- c(
+  "Arabidopsis thaliana" = "UP000006548",
+  "Saccharomyces cerevisiae" = "UP000002311",
+  "Caenorhabditis elegans" = "UP000001940",
+  "Drosophila melanogaster" = "UP000000803",
+  "Mus musculus" = "UP000000589",
+  "Rattus norvegicus" = "UP000002494",
+  "Gallus gallus" = "UP000000539"
+)
+# Checkpoint
+#load("output/data/hotspots/identifiers/prtmAllLst.RData")
+```
+
+
+Activate this chunk when you want to reload proteomes from scratch. Otherwise just run the chunk above
+```{r}
+prtmDirsAll <- map(proteomeCodes, ~paste0(home_directory, "data/biol_databases/uniprot/uniprotkb_proteome_",
+                                          ., "_2025_02_19.fasta"))
+prtmDirsRevi <- map(proteomeCodes, ~paste0(home_directory, "data/biol_databases/uniprot/uniprotkb_proteome_",
+                                          ., "_AND_revi_2025_02_19.fasta"))
+prtmDirsRevi$`Saccharomyces cerevisiae` <- prtmDirsAll$`Saccharomyces cerevisiae`
+
+#Load in proteomes
+prtmAllLst <- map(prtmDirsAll, read_fastaseq)
+prtmReviLst <- map(prtmDirsRevi, read_fastaseq)
+for (spec in names(prtmAllLst)){
+  prtmAllLst[[spec]]$revi <- prtmAllLst[[spec]]$uniprotkb %in% prtmReviLst[[spec]]$uniprotkb
+}
+#Extra arabidopsis proteome
+arabPrtmExtra <- read_fastaseq(paste0(home_directory, "data/biol_databases/uniprot/uniprotkb_proteome_",
+                                          "UP000426265", "_2025_02_19.fasta")) %>%
+  mutate(revi = F)
+prtmAllLst$`Arabidopsis thaliana` <- rbind(prtmAllLst$`Arabidopsis thaliana`,
+                                           subset(arabPrtmExtra, uniprotkb %in% prtmAllLst$`Arabidopsis thaliana`$uniprotkb == F))
+save(prtmAllLst, file = "output/data/hotspots/identifiers/prtmAllLst.RData")
+```
+
+
+### Compare matches to proteomes
+```{r}
+#Flag reviewed matches
+for (spec in names(identifMaps)){
+  identifMaps[[spec]]$inPrtm <- identifMaps[[spec]]$uniprot %in% prtmAllLst[[spec]]$uniprotkb
+  identifMaps[[spec]]$inRevi <- identifMaps[[spec]]$uniprot %in% subset(prtmAllLst[[spec]], revi == T)$uniprotkb
+}
+
+#Calculate numbers
+matchNumM <- map(names(identifMaps), function(spec){
+  mapDat <- identifMaps[[spec]]
+  input <- identifsSpecies[[spec]]
+  prtm <- prtmAllLst[[spec]]
+  mapDat <- mapDat[!is.na(mapDat$uniprot), ]
+  #How many matches?
+  inputNum <- length(input)
+  matchNum <- length(which(input %in% mapDat$From))
+  #How many matches in proteome?
+  matchPrtmNum <- length(which(input %in% subset(mapDat, uniprot %in% prtm$uniprotkb)$From))
+  matchReviNum <- length(which(input %in% subset(mapDat, uniprot %in% subset(prtm, revi == T)$uniprotkb)$From))
+  #Output
+  numVec <- c(inputNum, matchNum, matchPrtmNum, matchReviNum)
+  return(numVec)
+}) %>% purrr::reduce(rbind)
+rownames(matchNumM)  <- names(identifMaps)
+colnames(matchNumM) <- c("inputNum", "matchNum", "matchPrtmNum", "matchReviNum")
+```
+
+### Fuse matches
+```{r}
+identifMapDf <- map_dfr(identifMaps, function(dat){dat[, c("From", "uniprot", "inPrtm", "inRevi")]}, .id = "scientific_name")
+nrow(identifMapDf)
+nrow(distinct(identifMapDf))
+length(unique(identifMapDf$uniprot))
+```
+
+
+
+# 2. Non-human mapping: Pick uniprots
+```{r}
+identifMapDf <- identifMapDf[which(!is.na(identifMapDf$uniprot)), ] #Remove NAs
+
+#Make map data to hold map choices
+mapResultsDf <- map_dfr(identifsSpecies[-which(names(identifsSpecies) == "Homo sapiens")], function(x){data.frame("From" = unique(x))}, .id = "scientific_name")
+##Inspect number of matches at different levels
+numsTotal <- identifMapDf %>% distinct(., From, uniprot, .keep_all = T) %>% group_by(From) %>% 
+  summarise(numMatches = n(), 
+            numPrtmMatches = sum(inPrtm), numReviMatches = sum(inRevi))
+mapResultsDf <- left_join(mapResultsDf, numsTotal, by = "From")
+mapResultsDf[is.na(mapResultsDf)] <- 0
+
+mapResultsDf %>% split(.$scientific_name) %>% map(~table(.$numReviMatches))
+
+#Make matches
+pickUnip <- function(fromTemp){
+  mapDat <- subset(identifMapDf, From == fromTemp)
+  #Pick Revi if we can
+  reviInds <- which(mapDat$inRevi == T)
+  prtmInds <- which(mapDat$inPrtm == T)
+  if (length(reviInds) > 0){
+    choiceInds <- reviInds
+  #Else pick in prtm if we can
+  } else if (length(prtmInds) > 0) {
+    choiceInds <- prtmInds
+  } else {
+    choiceInds <- 1:nrow(mapDat)
+  }
+  choice <- mapDat$uniprot[choiceInds[1]]
+  return(choice)
+}
+mapResultsDf$uniprot <- NA
+for (i in 1:nrow(mapResultsDf)){
+  fromTemp <- mapResultsDf$From[i]
+  if (fromTemp %in% identifMapDf$From){
+    mapResultsDf$uniprot[i] <- pickUnip(fromTemp)
+  }
+}
+sum(is.na(mapResultsDf$uniprot))
+
+#Numbers for mapping
+mapResultsDf <- left_join(mapResultsDf, distinct(identifMapDf[, c("uniprot", "inPrtm", "inRevi")]), by = "uniprot")
+mapResultsDf$startingNum <- TRUE
+mapResultsDf$anyMatch <- !is.na(mapResultsDf$uniprot)
+boolCols <- c("startingNum", "anyMatch", "inPrtm", "inRevi")
+for (col in boolCols){
+  mapResultsDf[which(is.na(mapResultsDf[, col])), col] <- FALSE
+}
+mat <- mapResultsDf %>% split(.$scientific_name) %>% map(~colSums(.[, boolCols])) %>% purrr::reduce(rbind)
+rownames(mat) <- sort(unique(mapResultsDf$scientific_name))
+
+#Manually inspect those with multiple reviewed matches
+subset(mapResultsDf, numReviMatches > 2) %>% .[, c("From", "uniprot", "numReviMatches")]
+##Mouse histones
+mouseHistoneENSP <- read_delim("output/data/hotspots/identifiers/IDs_mouse_histone.txt") %>% 
+  .[, c("Protein stable ID", "Gene name", "Gene Synonym")] %>% distinct %>% as.data.frame
+mouseHistoneUnips <- mapUniProt(
+    from = "UniProtKB",
+    to = "UniProtKB",
+    query = subset(identifMapDf, From == "ENSMUSP00000077477" & inRevi == T)$uniprot
+)
+histoneMap <- list( #I manualy map these 9 proteins by using common gene names/synonyms
+  c("ENSMUSP00000077477", "H2ac4", "C0HKE1"),
+  c("ENSMUSP00000080088", "Hist1h2ap", "C0HKE9"),
+  c("ENSMUSP00000088281", "H2ac7", "C0HKE3"),
+  c("ENSMUSP00000088285", "Hist1h2ai", "C0HKE6"),
+  c("ENSMUSP00000089335", "Hist1h2ag", "C0HKE5"),
+  c("ENSMUSP00000089339", "Hist1h2ao", "C0HKE8"),
+  c("ENSMUSP00000089345", "Hist1h2an", "C0HKE7"),
+  c("ENSMUSP00000100034", "H2ac8 Hist1h2ae", "C0HKE4"),
+  c("ENSMUSP00000127684", "H2ac6 Hist1h2ac", "C0HKE2")
+) %>% purrr::reduce(rbind) %>% as.data.frame
+colnames(histoneMap) <- c("ENSP", "gene", "uniprot")
+for (i in 1:nrow(histoneMap)){
+  mapResultsDf[which(mapResultsDf$From == histoneMap$ENSP[i]), "uniprot"] <- histoneMap$uniprot[i]
+}
+##Calmodulins
+calmMap <- list( #I manually map these 3 genes by using common gene names
+  c("ENSMUSP00000019514", "Calm3", "P0DP28"),
+  c("ENSMUSP00000048857", "Calm2", "P0DP27"),
+  c("ENSMUSP00000105709", "Calm1", "P0DP26")
+) %>% purrr::reduce(rbind) %>% as.data.frame
+colnames(calmMap) <- c("ENSP", "gene", "uniprot")
+for (i in 1:nrow(calmMap)){
+  mapResultsDf[which(mapResultsDf$From == calmMap$ENSP[i]), "uniprot"] <- calmMap$uniprot[i]
+}
+```
+
+
+
+# 3. Non-human uniprots: Map sites
+## Get sequence windows (slow)
+```{r}
+#Load in
+ubnOmicsProtSeqs <- read_csv("data/features/ubnOmics/proteins_all.csv") %>%
+  dplyr::rename("ensp" = "id.2")
+#Are all proteins present?
+ubnOmicsSites %>% subset(ensp %in% ubnOmicsProtSeqs$ensp == F)
+
+#Extract sequence windows
+ubnOmicsSites <- ubnOmicsSites[order(ubnOmicsSites$scientific_name, ubnOmicsSites$ensp), ]
+unipsOffset <- c("", ubnOmicsSites$ensp[-nrow(ubnOmicsSites)])
+ubnOmicsSites$newUnip <- ubnOmicsSites$ensp != unipsOffset
+ubnOmicsSites$ensp_seqWind <- NA
+unipSeq <- ""
+##Loop over species to subset data
+species <- unique(ubnOmicsProtSeqs$scientific_name)
+for (spec in species){
+  inds <- which(ubnOmicsSites$scientific_name == spec)
+  seqDat <- subset(ubnOmicsProtSeqs, scientific_name == spec)
+  for (i in inds){
+    #Get objects
+    ensp <- ubnOmicsSites$ensp[i]
+    pos <- ubnOmicsSites$position[i]
+    #Get protein sequence
+    if (ubnOmicsSites$newUnip[i]){
+      unipSeq <- seqDat$sequence[which(seqDat$ensp == ensp)]
+      unipSeq <- paste(c(rep("_", 7), unipSeq, rep("_", 7)), collapse = "")
+    }
+    #Get position and sequence window
+    ubnOmicsSites$ensp_seqWind[i] <- substr(unipSeq, start = pos, stop = pos + 14)
+  }
+}
+ubnOmicsSitesSeqwinds <- ubnOmicsSites
+save(ubnOmicsSitesSeqwinds, file = "output/data/ubnOmicsSitesSeqwinds.RData")
+
+#Check that central positions are lysines
+ubnOmicsSitesSeqwinds$AA <- substr(ubnOmicsSitesSeqwinds$ensp_seqWind, 8, 8)
+subset(ubnOmicsSitesSeqwinds, AA != "K")
+```
+
+```{r}
+# Checkpoint
+#load("data/features/ubnOmics/ubnOmicsSitesSeqwinds.RData")
+```
+
+
+
+## Mapping
+### Set up
+```{r}
+#Set up map and get uniprot selections
+ubnOmicsSites_nonHsMap <- ubnOmicsSitesSeqwinds %>% subset(scientific_name != "Homo sapiens") %>% .[, c("ensp", "position", "scientific_name", "ensp_seqWind")] %>% distinct
+ubnOmicsSites_nonHsMap <- left_join(ubnOmicsSites_nonHsMap, 
+                                    mapResultsDf[, c("From", "uniprot")] %>% dplyr::rename("ensp" = "From"),
+                                    by = "ensp")
+#Flag missing uniprots to be dealt with later
+ubnOmicsSites_nonHsMap$uniprot[which(is.na(ubnOmicsSites_nonHsMap$uniprot))] <- "missing"
+```
+
+### Map into uniprot sequences, where possible
+```{r}
+#Set up looping in chunks of species and uniprots
+ubnOmicsSites_nonHsMap <- ubnOmicsSites_nonHsMap[order(ubnOmicsSites_nonHsMap$scientific_name, ubnOmicsSites_nonHsMap$uniprot), ]
+unipsOffset <- c("", ubnOmicsSites_nonHsMap$ensp[-nrow(ubnOmicsSites_nonHsMap)])
+ubnOmicsSites_nonHsMap$newUnip <- ubnOmicsSites_nonHsMap$ensp != unipsOffset
+unipSeq <- ""
+ubnOmicsSites_nonHsMap$matches <- NA
+
+#Loop over species
+species <- unique(ubnOmicsSites_nonHsMap$scientific_name)
+for (spec in species){
+  #Get the relevant proteome and subset it
+  specUnips <- subset(ubnOmicsSites_nonHsMap, scientific_name == spec)$uniprot %>% unique
+  seqDat <- prtmAllLst[[spec]] %>% subset(uniprotkb %in% specUnips) 
+  #Loop over sites in this proteome
+  inds <- which(ubnOmicsSites_nonHsMap$scientific_name == spec)
+  for (i in inds){
+    #Get objects
+    unip <- ubnOmicsSites_nonHsMap$uniprot[i]
+    seqWind <- ubnOmicsSites_nonHsMap$ensp_seqWind[i]
+    #Only proceed if uniprot is in the proteome
+    if (!is.na(unip) & unip %in% seqDat$uniprot){
+      #Get uniprot sequence
+      if (ubnOmicsSites_nonHsMap$newUnip[i]){
+        unipSeq <- seqDat$sequence[which(seqDat$uniprot == unip)]
+        unipSeq <- paste(c(rep("_", 7), unipSeq, rep("_", 7)), collapse = "")
+      }
+      #Match sequence window in
+      matchesDf <- stringr::str_locate_all(unipSeq, seqWind)[[1]]
+      if (nrow(matchesDf) == 0){
+        matches <- NA
+      } else {
+        newPosns <- as.numeric(matchesDf[, 1])
+        matches <- map(newPosns, ~paste0(unip, "_", .)) %>% unlist
+        matches <- paste(matches, collapse = ";")
+      }
+      ubnOmicsSites_nonHsMap$matches[i] <- matches
+    }
+  }
+}
+
+#Inspect matches
+ubnOmicsSites_nonHsMap$matches_num <- strsplit(ubnOmicsSites_nonHsMap$matches, ";") %>% 
+  map(function(x){
+    if (is.na(x[1])){ return(0) } else { return(length(x))}
+  }) %>% unlist
+
+table(ubnOmicsSites_nonHsMap$scientific_name, ubnOmicsSites_nonHsMap$matches_num)
+
+temp <- subset(ubnOmicsSites_nonHsMap, uniprot != "missing")
+table(temp$scientific_name, temp$matches_num)
+```
+
+### Map into the entire proteome when there are no matches
+```{r}
+#Perform mapping
+ubnOmicsSites_nonHsMap$matchesWholeProt <- NA
+for (spec in species){
+  #Get the relevant proteome and subset it
+  seqDat <- prtmAllLst[[spec]]
+  buff <- paste(rep("_", 7), collapse = "")
+  seqDat$sequence <- paste(buff, seqDat$sequence, buff, sep = "") #Pad all sequences
+  #Loop over sites in this proteome that have no matches
+  inds <- which(ubnOmicsSites_nonHsMap$scientific_name == spec &
+                  ubnOmicsSites_nonHsMap$matches_num == 0)
+  for (i in inds){
+    #Get objects
+    seqWind <- ubnOmicsSites_nonHsMap$ensp_seqWind[i]
+    #Mapping
+    mapping <- stringr::str_locate_all(seqDat$sequence, seqWind)
+    mappingBool <- map(mapping, ~(nrow(.) > 0)) %>% unlist
+    mappingInds <- which(mappingBool == TRUE)
+    if (length(mappingInds) == 0){ ##Return NULL if no map
+      output <- NA
+    } else {
+      ##Extract matches
+      matchesLst <- map(mappingInds, function(i){ #This accounts for if there are multiple matches in the same protein
+        matchesDf <- mapping[[i]]
+        unip <- seqDat$uniprotkb[i]
+        newPosns <- as.numeric(matchesDf[, 1])
+        matches <- map(newPosns, ~paste0(unip, "_", .)) %>% unlist
+        matches <- paste(matches, collapse = ";")
+        return(matches)
+      }) %>% 
+        unlist %>% paste(., collapse = ";") #Collapse multiple matches into one vector
+      output <- matchesLst
+    }
+    ubnOmicsSites_nonHsMap$matchesWholeProt[i] <- output
+  }
+} 
+
+#Get reviewed only 
+wholeProtMatchesLst <- strsplit(ubnOmicsSites_nonHsMap$matchesWholeProt, ";")
+wholeProtMatchesLst_Unips <- map(wholeProtMatchesLst, ~gsub("_\\d+$", "", .))
+wholeProtMatchesLst_revUnipsInds <- wholeProtMatchesLst_Unips
+for (spec in unique(ubnOmicsSites_nonHsMap$scientific_name)){
+  prtm <- prtmAllLst[[spec]] %>% subset(revi == TRUE)
+  for (i in which(ubnOmicsSites_nonHsMap$scientific_name == spec)){
+    wholeProtMatchesLst_revUnipsInds[[i]] <- wholeProtMatchesLst_revUnipsInds[[i]] %in% prtm$uniprotkb
+  }
+}
+wholeProtMatchesLst_revi <- map2(wholeProtMatchesLst, wholeProtMatchesLst_revUnipsInds, 
+                                 function(x, y){x[y]})
+ubnOmicsSites_nonHsMap$matchesWholeProt_revi <- map(wholeProtMatchesLst_revi, function(x){
+  if (length(x) == 0){
+    return(NA)
+  } else {
+    return(paste(x, collapse = ";"))
+  }
+}) %>% unlist
+
+#Inspect matches
+ubnOmicsSites_nonHsMap$matchesWholeProts_num <- strsplit(ubnOmicsSites_nonHsMap$matchesWholeProt, ";") %>% 
+  map(function(x){
+    if (is.na(x[1])){ return(0) } else { return(length(x))}
+  }) %>% unlist
+ubnOmicsSites_nonHsMap$matchesWholeProt_reviNum <- strsplit(ubnOmicsSites_nonHsMap$matchesWholeProt_revi, ";") %>% 
+  map(function(x){
+    if (is.na(x[1])){ return(0) } else { return(length(x))}
+  }) %>% unlist
+subset(ubnOmicsSites_nonHsMap, matches_num == 0)$matchesWholeProts_num %>% table
+subset(ubnOmicsSites_nonHsMap, matches_num == 0)$matchesWholeProt_reviNum %>% table
+
+temp <- subset(ubnOmicsSites_nonHsMap, matches_num == 0)
+table(temp$scientific_name, temp$matchesWholeProt_reviNum)
+```
+
+### Select final sites
+```{r}
+#Set up
+ubnOmicsSites_nonHsMap$finalMatches <- ubnOmicsSites_nonHsMap$matches
+
+#Proteome-wide matches: Pick reviewed where possible
+for (i in which(ubnOmicsSites_nonHsMap$matches_num == 0)){
+  if (ubnOmicsSites_nonHsMap$matchesWholeProt_reviNum[i] > 0){
+    ubnOmicsSites_nonHsMap$finalMatches[i] <- ubnOmicsSites_nonHsMap$matchesWholeProt_revi[i]
+  } else {
+    ubnOmicsSites_nonHsMap$finalMatches[i] <- ubnOmicsSites_nonHsMap$matchesWholeProt[i]
+  }
+}
+
+#When there are still multiple choices, prioritise those closest to the original position
+ubnOmicsSites_nonHsMap$finalMatchesNum <- strsplit(ubnOmicsSites_nonHsMap$finalMatches, ";") %>% 
+  map(function(x){
+    if (is.na(x[1])){ return(0) } else { return(length(x))}
+  }) %>% unlist
+ubnOmicsSites_nonHsMap$finalMatch <- ubnOmicsSites_nonHsMap$finalMatches
+for (i in 1:nrow(ubnOmicsSites_nonHsMap)){
+  if (ubnOmicsSites_nonHsMap$finalMatchesNum[i] > 1){
+    pos <- ubnOmicsSites_nonHsMap$position[i]
+    matches <- strsplit(ubnOmicsSites_nonHsMap$finalMatches[i], ";")[[1]]
+    matchesPos <- gsub("^.+_", "", matches) %>% as.numeric
+    closestInds <- which.min(abs(matchesPos - pos))
+    match <- matches[closestInds[1]]
+    ubnOmicsSites_nonHsMap$finalMatch[i] <- match
+  }
+}
+
+#Inspect
+table(!is.na(ubnOmicsSites_nonHsMap$finalMatch))
+```
+
+### Tidy and export
+```{r}
+ubnOmicsSites_nonHsMap <- ubnOmicsSites_nonHsMap %>%
+  dplyr::rename("uniprotOld" = "uniprot",
+                "positionOld" = "position",
+                "uniprot_pos" = "finalMatch") %>%
+  mutate(uniprot = gsub("_\\d+$", "", uniprot_pos),
+         position = gsub("^.+_", "", uniprot_pos))
+ubnOmicsSites_nonHsMapSub <- subset(ubnOmicsSites_nonHsMap, !is.na(uniprot_pos))
+#save(ubnOmicsSites_nonHsMapSub, file = "output/data/hotspots/ubnOmicsSites_nonHsMapSub__1.RData")
+```
+
+
+```{r}
+# Checkpoint
+# load("output/data/hotspots/ubnOmicsSites_nonHsMapSub__1.RData")
+```
+
+
+# 4. Combine mapped ubn sites
+
+## Load human sites
+I use sites from the PRIDE build
+```{r}
+load("data/features/ubiFeatProc__1.RData")
+
+humanSites <- ubiFeatProc %>%
+                           mutate(scientific_name = "Homo sapiens") %>%
+                           dplyr::rename("IDpos" = "Cons_ensp_pos", "sequence_window" =  "unipSeqWind") %>% 
+                           .[, c("IDpos", "scientific_name", "uniprot_pos", "sequence_window")]
+```
+
+## Combine
+```{r}
+ubnSitesUnipmap <- rbind(humanSites,
+                         ubnOmicsSites_nonHsMapSub %>% 
+                           mutate(IDpos = paste(ensp, positionOld, sep = "_")) %>%
+                           dplyr::rename("sequence_window" = "ensp_seqWind") %>% 
+                           .[, c("IDpos", "scientific_name", "uniprot_pos", "sequence_window")]) %>%
+  mutate(uniprot = gsub("_\\d+$", "", uniprot_pos),
+         position = gsub("^.+_", "", uniprot_pos) %>% as.numeric)
+ubnSitesUnipmap <- subset(ubnSitesUnipmap, !is.na(uniprot_pos))
+save(ubnSitesUnipmap, file = "output/data/hotspots/ubnSitesUnipmap__2.RData")
+# Checkpoint
+#load("output/data/hotspots/ubnSitesUnipmap__2.RData")
+```
+
+
+# 5. Extract InterPro domains with API call
+
+Load intermediates, in case you didn't run the above chunks
+```{r}
+load("output/data/hotspots/identifiers/prtmAllLst.RData")
+load("output/data/hotspots/ubnSitesUnipmap__2.RData")
+#load("output/data/hotspots/domains/IPRresLst__4.RData")
+```
+
+
+
+## Run API call, using cached results
+```{r}
+# Load from cache
+cacheF <- "output/data/hotspots/domains/IPRresLst__cache.RData"
+if (file.exists(cacheF)){
+  load(cacheF) # Data is a list called IPRresLst
+} else {
+  IPRresLst <- list()
+}
+
+# Set up uniprots
+apiUnips <- unique(ubnSitesUnipmap$uniprot)
+apiUnipsMissing <- setdiff(apiUnips, names(IPRresLst))
+
+# Run API on any uniprots that are missing
+if (length(apiUnipsMissing) > 0){
+  #Run APIs
+  start <- Sys.time()
+  IPRresLstNew <- list()
+  for (i in 1:length(apiUnipsMissing)){
+    if (i %% 10 == 0){print(i)}
+    unip <- apiUnipsMissing[i]
+    IPRresLstNew[[i]] <- callInterproAPI(unip)
+  }
+  names(IPRresLstNew) <- apiUnipsMissing
+  end <- Sys.time()
+  print(end - start)
+} else {
+  IPRresLstNew <- list()
+}
+
+# Update and save cache
+IPRresLst <- c(IPRresLst, IPRresLstNew)
+save(IPRresLst, file = cacheF)
+```
+
+## Process domain results
+```{r}
+#Combine
+IPRresDfLst <- map2(IPRresLst, names(IPRresLst), function(res, unip){
+  dat <- processInterproAPI(res)
+  if (!is.null(dat)){
+    dat$uniprot <- unip
+    dat <- as.data.table(dat)
+  }
+  return(dat)
+})
+boolVec <- map(IPRresDfLst, ~!is.null(.)) %>% unlist
+IPRresDf <- rbindlist(IPRresDfLst[boolVec])
+```
+
+## Check that uniprots from the list names match uniprots from results
+```{r}
+uniprotComp <- map2(IPRresLst, names(IPRresLst), function(res, unipFLst){
+  if (is.null(res)){
+    unipFRes <- NA
+  } else {
+    unipFRes <- toupper(res$results$proteins[[1]]$accession)
+  }
+  return(c(unipFLst, unipFRes))
+})
+unipComp <- purrr::reduce(uniprotComp, rbind)
+unipComp <- as.data.frame(unipComp)
+unipComp$comp <- unipComp$V1 == unipComp$V2
+table(unipComp$comp)
+```
+
+
+## Inspect domain results 
+```{r}
+#What failed?
+failedBool <- map(IPRresLst, is.null) %>% unlist
+failedNames <- names(IPRresLst)[failedBool]
+finalUnips <- ubnSitesUnipmap[, c("scientific_name", "uniprot")] %>% distinct
+finalUnips$IPRfailed <- finalUnips$uniprot %in% failedNames
+
+##Numbers that failed
+matchNumM <- finalUnips %>% split(.$scientific_name) %>% map(function(mapDat){
+  spec <- mapDat$scientific_name[1]
+  input <- identifsSpecies[[spec]]
+  prtm <- prtmAllLst[[spec]]
+  mapDat <- mapDat[!is.na(mapDat$uniprot), ]
+  #How many matches?
+  inputNum <- length(input)
+  #How many uniprots failed?
+  failNum <- subset(mapDat, IPRfailed == T)$uniprot %>% unique %>% length
+  #How many matches didn't fail?
+  matchNumNoFail <- length(which(input %in% subset(mapDat, IPRfailed == F)$From))
+  #Output
+  numVec <- c(inputNum, failNum, matchNumNoFail)
+  return(numVec)
+}) %>% purrr::reduce(rbind)
+rownames(matchNumM)  <- sort(unique(identifMapDf$scientific_name))
+colnames(matchNumM) <- c("inputNum", "failNum", "matchNumNoFail")
+
+##Inspect those that failed
+finalUnips %>% split(.$scientific_name) %>% map(~subset(., IPRfailed == T)$uniprot %>% unique %>% .[1:20])
+```
+
+
+Protein lengths
+```{r}
+prtmProtLengths <- map_dfr(prtmAllLst, function(x){
+  x$length <- str_length(x$sequence)
+  return(x[, c("uniprotkb", "length")])
+}, .id = "scientific_name")
+prtmProtLengths <- rbind(prtmProtLengths, 
+                         uniprotHsIso %>% 
+                           mutate(length = str_length(sequence),
+                                                 scientific_name = "Homo sapiens") %>%
+                           .[, c("scientific_name", "uniprotkb", "length")])
+
+IPRprotLengths <- data.frame("length" = map(IPRresLst, ~.$results$proteins[[1]]$protein_length) %>% unlist,
+                             "uniprotkb" = map(IPRresLst, ~.$results$proteins[[1]]$accession) %>% unlist) %>%
+  mutate(uniprotkb = toupper(uniprotkb))
+IPRprotLengths <- left_join(IPRprotLengths, dplyr::rename(prtmProtLengths, "lengthPrtm" = "length"), by = "uniprotkb") %>%
+  mutate(comp = length == lengthPrtm)
+subset(IPRprotLengths, comp == F)
+```
+
+
+
+# 6. Prepare InterPro domain results
+## Map in ubn sites
+```{r}
+#Split out multiple matches within one protein into separate entires
+IPRresDfSplt <- separate_rows(IPRresDf, c("start", "end"), sep = ";") %>%
+  mutate(start = as.numeric(start), end = as.numeric(end))
+
+#Subset for domains containing ubn sites
+##Define total catchment per protein
+domainVecs <- map(1:nrow(IPRresDfSplt), ~IPRresDfSplt$start[.]:IPRresDfSplt$end[.])
+##Get positions per uniprot
+posnVecs <- ubnSitesUnipmap %>% split(.$uniprot) %>% map(~.$position)
+##Intersect uniprot positions with domain positions
+intersectVec <- map(1:length(domainVecs), function(i){
+  unip <- IPRresDfSplt$uniprot[i]
+  posns <- posnVecs[[unip]]
+  return(intersect(posns, domainVecs[[i]]))
+})
+head(intersectVec)
+IPRresDfSplt$ubnSites <- map(intersectVec, function(x){
+  if (length(x) == 0){
+    return(NA)
+  } else {
+    return(paste(x, collapse = ";"))
+  }
+}) %>% unlist
+IPRresDfSplt$hasUbnSites <- !is.na(IPRresDfSplt$ubnSites)
+table(IPRresDfSplt$hasUbnSites)
+IPRresDfSpltSub <- subset(IPRresDfSplt, hasUbnSites == T)
+IPRresDfSpltSub$ubnSiteNum <- strsplit(IPRresDfSpltSub$ubnSites, ";") %>% map(length) %>% unlist
+```
+
+## Extract table of all proteins, their domains, and their ubi-sites
+```{r}
+UniprotDomainUbisites <- IPRresDfSpltSub
+save(UniprotDomainUbisites, file = "output/data/hotspots/UniprotDomainUbisites__2.RData")
+# Checkpoint
+#load("output/data/hotspots/UniprotDomainUbisites__2.RData")
+#IPRresDfSpltSub <- UniprotDomainUbisites
+```
+
+
+## Extract domain sequences
+```{r}
+#Add scientific name
+IPRresDfSpltSub <- left_join(IPRresDfSpltSub, distinct(ubnSitesUnipmap[, c("uniprot", "scientific_name")]), by = "uniprot")
+
+#Extract domain sequences
+IPRresDfSpltSub <- IPRresDfSpltSub[order(IPRresDfSpltSub$scientific_name, IPRresDfSpltSub$uniprot), ]
+unipsOffset <- c("", IPRresDfSpltSub$uniprot[-nrow(IPRresDfSpltSub)])
+IPRresDfSpltSub$newUnip <- IPRresDfSpltSub$uniprot != unipsOffset
+IPRresDfSpltSub$sequence <- NA
+unipSeq <- ""
+##Loop over species to subset data
+species <- unique(IPRresDfSpltSub$scientific_name)
+for (spec in species){
+  inds <- which(IPRresDfSpltSub$scientific_name == spec)
+  if (spec == "Homo sapiens"){
+    seqDat <- uniprotHsIso
+  } else {
+    seqDat <- prtmAllLst[[spec]]
+  }
+  for (i in inds){
+    #Get objects
+    unip <- IPRresDfSpltSub$uniprot[i]
+    start <- IPRresDfSpltSub$start[i]
+    end <- IPRresDfSpltSub$end[i]
+    #Get protein sequence
+    if (IPRresDfSpltSub$newUnip[i]){
+      unipSeq <- seqDat$sequence[which(seqDat$uniprotkb == unip)]
+    }
+    #Get position and sequence window
+    IPRresDfSpltSub$sequence[i] <- substr(unipSeq, start = start, stop = end)
+  }
+}
+```
+
+
+## Filter domains
+```{r}
+IPRresDfSpltSub <- IPRresDfSpltSub %>%
+   group_by(accession, uniprot) %>%
+  mutate(UID = paste(accession, uniprot, row_number(), sep = "_")) %>%
+  ungroup()
+#Summarise at domain level
+IPRresDfSpltSub_summ <- IPRresDfSpltSub[, c("accession", "pfam", "ubnSiteNum", "UID")] %>%
+  group_by(accession) %>%
+  summarise(instanceNum = n(), ubnSiteNum = sum(ubnSiteNum))
+#Filter
+filteredDomains <- subset(IPRresDfSpltSub_summ,
+                          instanceNum >= 15 &
+                          ubnSiteNum >= 50)
+```
+
+
+## Export for alignment
+```{r}
+for (j in 1:nrow(filteredDomains)){
+  domainName <- filteredDomains$accession[j]
+  domainDatSub <- subset(IPRresDfSpltSub, accession == domainName)
+  #Prep fasta
+  fastaNames <- map(1:nrow(domainDatSub), function(i){
+    unip <- domainDatSub$uniprot[i]
+    startEnd <- as.character(domainDatSub[i, c("start", "end")])
+    paste(c(unip, startEnd), collapse = ";")
+  }) %>% unlist
+  fastaSeqs <- domainDatSub$sequence
+  fastaSeqs <- BStringSet(fastaSeqs)
+  names(fastaSeqs) <- fastaNames
+  #Write fasta
+  writeXStringSet(fastaSeqs, filepath = paste0("output/data/hotspots/domains/domainsPreAlign/", domainName, ".fasta"),
+                  width = 20000)
+}
+```
+
+
+## Format sites
+```{r}
+#Subset for tested domains
+domainSites <- IPRresDfSpltSub %>% subset(accession %in% filteredDomains$accession) %>%
+  separate_rows("ubnSites", sep = ";") %>%
+  mutate(uniprot_pos = paste(uniprot, ubnSites, sep = "_")) %>%
+  mutate(AA = "K")
+
+#Format
+domainSitesExp <- domainSites[, c("scientific_name", "uniprot", "ubnSites", "AA", "accession", "start", "end", "pfam")]
+write_csv(domainSitesExp, file = "output/data/hotspots/ubnSites_forHotspots", col_names = F)
+```
+
+
+# 6b. Run the hotspot script 
+- Move output from output/data/hotspots/domains/domainsPreAlign and output/data/hotspots/ubnSites_forHotspots to the cluster
+- Run scripts/hotspot_scripts/02_runMAFFT_for_hotspots.py to align domain sequences
+- Run scripts/hotspot_scripts/03_run_ptm_hotspots.py to run hotspot analysis
+- Move output from output/data/hotspots/hotspotOutput.csv back to local
+
+# 7. Process hotspot output
+## Make table for hotspots
+```{r}
+hotspotRes <- read_csv("output/data/hotspots/domains/hotspotOutput/hotspotOutput.csv")
+#Make table for individual hotspots
+hotspotDf <- hotspotRes[, c("domain", "hotspot_id", "start_aln", "end_aln", "min_adj_pval")] %>% distinct 
+##Add pfam info
+hotspotDf <- left_join(hotspotDf, 
+                       IPRresDfSpltSub[, c("accession", "pfam")] %>% dplyr::rename("domain" = "accession") %>% distinct,
+                       by = "domain")
+hotspotDfPfams <- hotspotDf %>% separate_rows("pfam", sep = ";")
+length(unique(hotspotDfPfams$pfam))
+##Extract domain names
+hotspotDf[, c("interpro_name", "interpro_nameShort")] <- NA
+for (i in 1:nrow(hotspotDf)){
+  inteproID <- hotspotDf$domain[i]
+  ###make API call
+  base_url <- "https://www.ebi.ac.uk/interpro/api/entry/interpro/"
+  url <- paste0(base_url, "/", inteproID, "?format=json")
+  response <- GET(url)
+  apiDat <- fromJSON(httr::content(response, as = "text"), flatten = F)
+  ###Get output
+  hotspotDf$interpro_name[i] <- apiDat$metadata$name$name
+  hotspotDf$interpro_nameShort[i] <- apiDat$metadata$name$short
+}
+#Make domain identifier with domain domain
+hotspotDf <- get_hotspot_idwName(data = hotspotDf, interpro_name = "interpro_name", hotspot_id = "hotspot_id")
+
+#Extract # structures and representative structures
+hotspotDf[, c("strRep", "strNum")] <- NA
+for (i in 1:nrow(hotspotDf)){
+  inteproID <- hotspotDf$domain[i]
+  #Representative structure
+  base_url <- "https://www.ebi.ac.uk/interpro/api/entry/interpro/"
+  url <- paste0(base_url, "/", inteproID, "?format=json")
+  response <- GET(url)
+  apiDat <- fromJSON(httr::content(response, as = "text"), flatten = F)
+  ###Get output
+  res <- apiDat$metadata$representative_structure$accession
+  if (!is.null(res)){
+    hotspotDf$strRep[i] <- res[1]
+  }
+  
+  #Number of structures
+  base_url <- "https://www.ebi.ac.uk/interpro/api/structure/entry/interpro/"
+  url <- paste0(base_url, "/", inteproID, "?format=json")
+  response <- GET(url)
+  apiDat <- fromJSON(httr::content(response, as = "text"), flatten = F)
+  ###Get output
+  res <- apiDat$structures$pdb
+  if (!is.null(res)){
+    hotspotDf$strNum[i] <- res[1]
+  }
+}
+
+#Manually adjust representative structures
+repStr_manual_lst <- list(
+  c("IPR000719", "5uq2") #Protein kinase. I change to one with a resolved activation loop
+)
+for (x in repStr_manual_lst){
+  hotspotDf$strRep[which(hotspotDf$domain == x[1])] <- x[2]
+}
+```
+
+
+## Overview
+```{r}
+# Overivew
+print("# hotspots")
+print(nrow(hotspotDf))
+
+print("# domains with hotspots")
+print(length(unique(hotspotDf$domain)))
+```
+
+
+## Map hotspot regions into the corresponding domains
+```{r}
+# Map maps between absolute positions and alignment positions
+alignDir <- "output/data/hotspots/domains/domainsPostAlignUnwrap"
+alignColmaps <- list()
+for (domainName in unique(hotspotDf$domain)){
+  fastaF <- paste0(alignDir, "/", domainName, ".fasta")
+  alignment_position_maps <- get_alignmentMap(fastaF)
+  alignColmaps[[domainName]] <- alignment_position_maps
+}
+# Collect all positions present in each hotspot
+hotspot_absolute_regions <- list()
+k <- 1
+for (i in 1:nrow(hotspotDf)){
+  hotspot_id_sel <- hotspotDf$hotspot_id[i]
+  domainName <- gsub("_.+$", "", hotspot_id_sel)
+  hotspot <- hotspotDf$start_aln[i]:hotspotDf$end_aln[i]
+  # Get alignment map
+  alignColmap <- alignColmaps[[domainName]]
+  # Loop over alignment map and extract absolute positions in the hotspot region
+  for (j in 1:length(alignColmap)){
+    domainId <- names(alignColmap)[j]
+    mapp <- alignColmap[[j]]
+    absoluteRegion <- subset(mapp, alignment_position %in% hotspot)$absolute_position
+    if (length(absoluteRegion) > 0){
+      resLst <- list(
+        "domainId" = domainId, "pos" = absoluteRegion, "hotspot" = hotspot_id_sel
+      )
+      hotspot_absolute_regions[[k]] <- resLst
+      k <- k + 1
+    }
+  }
+}
+hotspotAbsoluteRegions <- map_dfr(hotspot_absolute_regions, function(lst){
+  data.frame(
+    "domainId" = lst$domainId, "hotspot" = lst$hotspot, "pos" = lst$pos
+  ) %>% mutate(
+    uniprot = strsplit(domainId, ";") %>% map(~.[1]) %>% unlist,
+    domainStart = strsplit(domainId, ";") %>% map(~.[2]) %>% unlist %>% as.numeric,
+    domainEnd = strsplit(domainId, ";") %>% map(~.[3]) %>% unlist %>% as.numeric
+    )
+}, .id = "id")
+```
+
+
+
+## Also extract absolute hotspot positions from hotspotResidueOutput 
+```{r}
+# Load residue-level hotspot results
+hotspotResidueRes <- read_csv("output/data/hotspots/domains/hotspotOutput/hotspotResidueOutput.csv")
+
+# Subset for alignment regions
+hotspotAbsoluteRegions_fResidue <- hotspotResidueRes
+hotspotAbsoluteRegions_fResidue$in_hotspot <- FALSE
+for (i in 1:nrow(hotspotDf)){
+  ind <- which(
+    hotspotAbsoluteRegions_fResidue$domain == hotspotDf$domain[i] & 
+    hotspotAbsoluteRegions_fResidue$position_aln >= hotspotDf$start_aln[i] & 
+    hotspotAbsoluteRegions_fResidue$position_aln <= hotspotDf$end_aln[i]
+  )
+  hotspotAbsoluteRegions_fResidue$in_hotspot[ind] <- TRUE
+}
+hotspotAbsoluteRegions_fResidue <- subset(hotspotAbsoluteRegions_fResidue, in_hotspot == T)
+```
+
+
+## Annotate domainSites with presence in hotspot region
+```{r}
+domainSites$position <- gsub("^.+_", "", domainSites$uniprot_pos) %>% as.numeric
+
+# from hotspotAbsoluteRegions
+hotspotAbsoluteRegions$uniprot_pos <- paste(hotspotAbsoluteRegions$uniprot, hotspotAbsoluteRegions$pos, sep = "_")
+## Subset for domain sites
+hotspotAbsoluteRegions_siteSub <- subset(hotspotAbsoluteRegions, uniprot_pos %in% domainSites$uniprot_pos)
+## Collapse hotspots
+hotspotAbsoluteRegions_siteSub <- hotspotAbsoluteRegions_siteSub %>% 
+  .[order(.$hotspot), ] %>% group_by(uniprot_pos) %>% 
+  summarise(hotspot = paste(hotspot, collapse = ";")) %>% ungroup
+## Add to domainSites
+domainSites <- left_join(domainSites, hotspotAbsoluteRegions_siteSub, by = "uniprot_pos")
+domainSites$in_hotspot <- !is.na(domainSites$hotspot)
+domainSites <- domainSites %>% dplyr::rename("hotspot_id" = "hotspot")
+
+# from hotspotAbsoluteRegions_fResidue
+hotspotAbsoluteRegions_fResidue$uniprot_pos <- paste(hotspotAbsoluteRegions_fResidue$protein, hotspotAbsoluteRegions_fResidue$position, sep = "_")
+domainSites$in_hotspot_fResidue <- domainSites$uniprot_pos %in% hotspotAbsoluteRegions_fResidue$uniprot_pos
+table(domainSites$in_hotspot_fResidue, domainSites$in_hotspot)
+```
+
+
+## Subset for hotspot sites
+```{r}
+#Make a table just for sites in hotspots
+hotspotSites <- domainSites %>% subset(!is.na(hotspot_id)) %>% 
+  .[, c("uniprot_pos", "uniprot", "scientific_name", "AA", "position", "hotspot_id")] %>%
+  mutate(site = paste0(AA, position)) %>%
+  mutate(uniprot_site = paste(uniprot, site, sep = "_"))
+##Map in hotspot info
+hotspotSites <- separate_rows(hotspotSites, "hotspot_id", sep = ";") #First expand to the hotspot level
+hotspotSites <- left_join(hotspotSites, hotspotDf, by = "hotspot_id")
+##Collapse at the individual site level
+hotspotSites <- distinct(hotspotSites)
+hotspotSites <- hotspotSites %>% group_by(uniprot_site) %>%
+  summarise_all(~paste(unique(.), collapse = ";"), .groups = "drop")
+hotspotSites <- as.data.frame(hotspotSites)
+```
+
+
+## Make table for domains with hotspots. This includes preparing representative structures and sequences
+```{r}
+#Data just for hotspot domains
+hotspotDomainDf <- hotspotDf[, c("domain", "pfam", "interpro_name", "interpro_nameShort", "strRep", "strNum")] %>% distinct
+
+#For each representative structure, extract the corresponding domain sequences
+##Set up which identifier to use. This is almost always Intepro, but for one domain only the pfam works
+hotspotDomainDf$queryDomainID <- hotspotDomainDf$domain
+hotspotDomainDf$queryDomainID[which(hotspotDomainDf$domain == "IPR002213")] <- "PF00201"
+##Run APIs
+hotspotDomainDf[, c("strRep_chain", "strRep_start", "strRep_end", "strRep_seq",
+                    "strRep_startAuthor", "strRep_endAuthor")] <- NA
+for (i in which(!is.na(hotspotDomainDf$strRep))){
+  interproID <- hotspotDomainDf$queryDomainID[i]
+  PDBid <- hotspotDomainDf$strRep[i]
+  
+  #API call for structures with the domain
+  url <- paste0("https://www.ebi.ac.uk/pdbe/api/mappings/", interproID, "?format=json")
+  response <- GET(url)
+  apiDat <- fromJSON(httr::content(response, as = "text"), flatten = F)
+  #Select one chain
+  ##Only proceed if the PDB is in the corresponding interpro
+  if (PDBid %in% names(apiDat[[1]]$PDB)){
+    chainDat <- apiDat[[1]]$PDB[[PDBid]][1, ]
+    #Extract results
+    hotspotDomainDf$strRep_chain[i] <- chainDat$chain_id[1]
+    hotspotDomainDf$strRep_start[i] <- chainDat$start$residue_number[1]
+    hotspotDomainDf$strRep_end[i] <- chainDat$end$residue_number[1]
+    hotspotDomainDf$strRep_startAuthor[i] <- chainDat$start$author_residue_number[1]
+    hotspotDomainDf$strRep_endAuthor[i] <- chainDat$end$author_residue_number[1]
+    
+    #API call for the structure sequence
+    url <- paste0("https://www.ebi.ac.uk/pdbe/api/pdb/entry/molecules/", PDBid, "?format=json")
+    response <- GET(url)
+    apiDat <- fromJSON(httr::content(response, as = "text"), flatten = F)
+    strDat <- apiDat[[PDBid]] %>%
+      subset(grepl("polypeptide", molecule_type))
+    #Loop over entities and check that they are in the right chain
+    for (j in 1:nrow(strDat)){
+      if (chainDat$chain_id[1] %in% strDat$in_chains[[j]]){
+        hotspotDomainDf$strRep_seq[i] <- strDat$sequence[j]
+      }
+    }
+  }
+}
+##Subset sequences for domains
+hotspotDomainDf$strRep_seqDomain <- substr(hotspotDomainDf$strRep_seq, 
+                                           start = hotspotDomainDf$strRep_start,
+                                           stop = hotspotDomainDf$strRep_end)
+
+#Export representative domain sequences for MAFFT
+wRep <- hotspotDomainDf %>% 
+  filter(!is.na(strRep)) %>% 
+  distinct(domain, .keep_all = TRUE)  # Zinc finger has multipel hotspots but slightly different PFAM domains, so I fix this
+##Prepare an identifier like that recognised by hotspot analysis
+wRep$id <- paste0(wRep$domain, "__", wRep$strRep, ";", wRep$strRep_start, ";", wRep$strRep_end)
+repDomainSeqs <- setNames(wRep$strRep_seqDomain, wRep$id)
+writeXStringSet(BStringSet(repDomainSeqs), filepath = "output/data/hotspots/domains/representativeStrs/strRep_seqDomain.fasta",
+                width = 20000)
+```
+
+
+# 7b. Run representative hotspot script
+- Move output from output/data/hotspots/domains/representativeStrs/strRep_seqDomain.fasta to the cluster 
+- Run scripts/hotspot_scripts/04_repStrsMAFFT.py to align domain sequences with the representative structure 
+- Run scripts/hotspot_scripts/05_repStrsHotspots.py to run hotspot analysis with the representative structure
+- Move output from output/data/hotspots/domains/representativeStrs back to local 
+
+## Inspect representative sequence results
+```{r}
+#load in data
+hotspotOutRep <- read_csv("output/data/hotspots/domains/representativeStrs/hotspotOutput.csv")
+hotspotResRep <- read_csv("output/data/hotspots/domains/representativeStrs/hotspotResidueOutput.csv")
+hotspotResRep_repOnly <- read_csv("output/data/hotspots/domains/representativeStrs/hotspotResidueOutput_strRep.csv") %>%
+  as.data.frame 
+
+#Check number of hotspots
+##Set up
+repHotspots <- unique(hotspotOutRep$hotspot_id) %>% sort
+OGhotspots <- subset(hotspotDf, domain %in% hotspotResRep$domain)$hotspot_id %>% unique %>% sort
+hotspotLst <- list("OG" = OGhotspots, "rep" = repHotspots)
+hotspotLst <- map(hotspotLst, function(vec){
+  data.frame("hotspot_id" = vec, "domain" = gsub("_\\d+$", "", vec))
+})
+##Multiplicity per domain
+hotspotSummLst <- map(hotspotLst, ~group_by(., domain) %>% summarise(n = n()))
+hotspotSumm <- hotspotSummLst$OG %>% dplyr::rename("n_OG" = "n") %>%
+  left_join(., dplyr::rename(hotspotSummLst$rep, "n_rep" = "n"), by = "domain")
+subset(hotspotSumm, is.na(n_rep) | n_rep != n_OG)
+
+#Check coverage of hotspots
+hotspotResRep_repOnlySig <- hotspotResRep_repOnly %>% subset(hotspot == TRUE)
+hotspotResRep_repOnlySig$domain %>% unique %>% length
+subset(hotspotResRep_repOnlySig, !is.na(position_representative))$domain %>% unique %>% length
+```
+
+
+
+# 8. Export hotspot results
+```{r}
+save(hotspotDf, file = "output/data/hotspots/domains/hotspotDf__3.RData")
+save(hotspotDomainDf, file = "output/data/hotspots/domains/hotspotDomainDf__3.RData")
+write.csv(hotspotDomainDf, file = "output/data/hotspots/domains/hotspotDomainDf__3.csv")
+save(domainSites, file = "output/data/hotspots/domains/domainSites__3.RData")
+save(hotspotSites, file = "output/data/hotspots/domains/hotspotSites__3.RData")
+write.csv(hotspotSites, file = "output/data/hotspots/domains/hotspotSites__3.csv")
+```
+

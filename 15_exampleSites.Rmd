@@ -1,0 +1,215 @@
+# Background
+Here I look at examples of high-scoring sites
+
+# Initialise
+```{r}
+library(tidyverse)
+library(purrr)
+library(ggplot2)
+library(ggridges)
+library(readxl)
+library(openxlsx)
+
+home_directory <- ""
+source(paste0(home_directory, "scripts/essential_visualisations_JvG.R"))
+source(paste0(home_directory, "scripts/enrichment_analysis_JvG.R"))
+source("scripts/01_general.R")
+source("scripts/00_objects.R")
+source("scripts/03_visualisations.R")
+source("scripts/04_ubnOmics.R")
+
+#Load data
+load("data/functional_scores/ubiFeatPreds__7.RData")
+load("data/features/ubnOmics/ubnOmicsFeauresAll__4.RData")
+load("data/features/ubnOmics/ubnOmicsComp_hsPRIDE_lst__8.RData")
+
+#Get gene identifiers for our ubi sites
+library(AnnotationDbi)
+library(org.Hs.eg.db)
+collapseFunc <- function(x){
+    x <- unique(x)
+    if (is.na(x[1])){
+        return(NA)
+    } else {
+        return(paste(x, collapse = ";"))
+    }
+}
+geneMap <- AnnotationDbi::select(org.Hs.eg.db, keys = unique(ubiFeatPreds$uniprot), keytype = "UNIPROT",
+                                    columns = c("SYMBOL")) %>% 
+                                group_by(UNIPROT) %>% 
+                                summarise(gene = collapseFunc(SYMBOL))
+ubiFeatPreds <- left_join(ubiFeatPreds, dplyr::rename(geneMap, "uniprot" = "UNIPROT"), by = "uniprot")
+ubiFeatPreds$gene_site <- paste(ubiFeatPreds$gene, ubiFeatPreds$site, sep = "_")
+```
+
+
+
+# FANCI to exemplify the functional score
+This is a good example where the features prioritise a known regulatory site. I visualise this
+
+## Set up
+```{r}
+FANCIdat <- subset(ubiFeatPreds, gene == "FANCI") %>% 
+    dplyr::relocate("functional_score", "PSP_reg", "pos", featureCols)
+
+# Just get the regulatory site and other nearby sites
+FANCIdatSub <- subset(ubiFeatPreds, gene == "FANCI") %>% 
+    dplyr::relocate("functional_score", "PSP_reg", "pos", featureCols) %>% 
+    subset(pos %in% c(523, 501, 508, 534))
+```
+
+## Plot features
+```{r}
+# Add spacing structure to account for the alignment
+spacing <- c(NA, 501, rep(NA, 5), 508, rep(NA, 5), 523, rep(NA, 5), 534, NA)
+names(spacing) <- map2(spacing, 1:length(spacing), function(x, y){if (is.na(x)){paste0("sp", y)} else {as.character(x)}}) %>% unlist
+plotDatSpacing <- data.frame("ID" = names(spacing), "pos" = spacing) %>% left_join(., plotDat, by = "pos") %>% 
+    mutate(ID = factor(ID, levels = names(spacing)))
+
+# Select features
+pltLst <- list()
+plotDatComb <- list()
+featureGroupCols_wScore <- c("Functional score" = "#2573b6", featureGroupCols)
+featureGroupFills_wScore <- c("Functional score" = "#b3d1e1", featureGroupFills)
+feats <- c("functional_score", "FinalBoxProcNum", "PRIDE_set", "numReg_notPrtsm", "interface_label", "mutR_am_pathogenicity_all")
+
+for (feat in feats){
+##### Plotting #####
+    # Convert to numeric
+    plotDatSpacing[, feat] <- as.numeric(plotDatSpacing[, feat])
+    # Get axis label
+    bool <- map(featureNames, ~.[[1]] == feat) %>% unlist 
+    if (feat == "functional_score"){
+        yaxis <- "Functional score"
+        grp <- "Functional score"
+    } else if (feat == "PRIDE_set"){
+        yaxis <- "Identification confidence"
+        grp <- "Proteomics"
+        plotDatSpacing[, feat] <- plotDatSpacing[, feat] - 1
+    } else if (sum(bool) > 0){
+        lst <- featureNames[[which(bool)]]
+        yaxis <- lst[[2]]
+        grp <- lst[[3]]
+    } else {
+        yaxis <- feat
+        grp <- "Other"
+    }
+    # Plot one 
+    pltLst[[feat]] <- ggplot(plotDatSpacing, aes(x = ID, y = !!sym(feat))) + 
+        geom_col(width = 1, fill = "#a3c9d7") + 
+        comfy_theme(include_xaxis = F) +
+        theme(panel.border = element_rect(colour = "#5c5c5c", fill = NA, size = 0.235)) +
+        scale_x_discrete(breaks = spacing[!is.na(spacing)]) +
+        labs(x = "Position", y = yaxis)
+    # Add to combined data
+    dat <- plotDatSpacing[, c(feat, "ID")]
+    colnames(dat)[1] <- "val"
+    dat$group <- grp
+    dat$yaxis <- yaxis
+    plotDatComb[[feat]] <- dat
+}
+
+# Plot combined
+plotDatComb <- map_dfr(plotDatComb, function(x){x}, .id = "feat") %>% 
+    mutate(feat = factor(feat, levels = feats),
+            group = factor(group, levels = c("Functional score", featureGroups)))
+ggplot(plotDatComb, aes(x = ID, y = val, fill = group, colour = group)) + 
+        geom_col(width = 1, size = 0.235) + 
+        comfy_theme(include_xaxis = F) +
+        theme(panel.border = element_rect(colour = "#5c5c5c", fill = NA, size = 0.235),
+                axis.text.x = element_text(size = 6, colour = "black"),
+                axis.text.y = element_text(size = 6, colour = "black")) +
+        scale_x_discrete(breaks = spacing[!is.na(spacing)]) +
+        labs(x = "Position", y = "val")  + 
+        facet_wrap(~feat, ncol = 1, scales = "free") + 
+        scale_fill_manual(values = featureGroupFills_wScore) + 
+        scale_colour_manual(values = featureGroupCols_wScore)
+ggsave_pdfpng(file = "output/images/functional_scores/examples/FANCI/bar_scoresfeats_FANCI", width = 3.5, height = 4.5)
+```
+
+
+## Repeat for FANCD2
+
+### Set up
+```{r}
+FANCD2dat <- subset(ubiFeatPreds, gene == "FANCD2") %>% 
+    dplyr::relocate("functional_score", "PSP_reg", "pos", featureCols)
+
+FANCD2dat %>% dplyr::relocate(c("pos", "functional_score")) %>% View
+
+# Just get the regulatory site and other nearby sites
+FANCD2datSub <- subset(ubiFeatPreds, gene == "FANCD2") %>% 
+    dplyr::relocate("functional_score", "PSP_reg", "pos", featureCols) %>% 
+    subset(pos %in% c(561, 366, 358, 569))
+```
+
+
+### Plot features
+```{r}
+# Add spacing structure to account for the alignment
+spacing <- map(sort(FANCD2datSub$pos, decreasing = F), ~c(rep(NA, 5), .)) %>% unlist
+spacing <- c(spacing[5:length(spacing)], NA)
+names(spacing) <- map2(spacing, 1:length(spacing), function(x, y){if (is.na(x)){paste0("sp", y)} else {as.character(x)}}) %>% unlist
+plotDatSpacing <- data.frame("ID" = names(spacing), "pos" = spacing) %>% left_join(., FANCD2dat, by = "pos") %>% 
+    mutate(ID = factor(ID, levels = names(spacing)))
+
+# Select features
+pltLst <- list()
+plotDatComb <- list()
+featureGroupCols_wScore <- c("Functional score" = "#2573b6", featureGroupCols)
+featureGroupFills_wScore <- c("Functional score" = "#b3d1e1", featureGroupFills)
+feats <- c("functional_score", "FinalBoxProcNum", "PRIDE_set", "numReg_notPrtsm", "interface_label", "mutR_am_pathogenicity_all")
+
+for (feat in feats){
+##### Plotting #####
+    # Convert to numeric
+    plotDatSpacing[, feat] <- as.numeric(plotDatSpacing[, feat])
+    # Get axis label
+    bool <- map(featureNames, ~.[[1]] == feat) %>% unlist 
+    if (feat == "functional_score"){
+        yaxis <- "Functional score"
+        grp <- "Functional score"
+    } else if (feat == "PRIDE_set"){
+        yaxis <- "Identification confidence"
+        grp <- "Proteomics"
+        plotDatSpacing[, feat] <- plotDatSpacing[, feat] - 1
+    } else if (sum(bool) > 0){
+        lst <- featureNames[[which(bool)]]
+        yaxis <- lst[[2]]
+        grp <- lst[[3]]
+    } else {
+        yaxis <- feat
+        grp <- "Other"
+    }
+    # Plot one 
+    pltLst[[feat]] <- ggplot(plotDatSpacing, aes(x = ID, y = !!sym(feat))) + 
+        geom_col(width = 1, fill = "#a3c9d7") + 
+        comfy_theme(include_xaxis = F) +
+        theme(panel.border = element_rect(colour = "#5c5c5c", fill = NA, size = 0.235)) +
+        scale_x_discrete(breaks = spacing[!is.na(spacing)]) +
+        labs(x = "Position", y = yaxis)
+    # Add to combined data
+    dat <- plotDatSpacing[, c(feat, "ID")]
+    colnames(dat)[1] <- "val"
+    dat$group <- grp
+    dat$yaxis <- yaxis
+    plotDatComb[[feat]] <- dat
+}
+
+# Plot combined
+plotDatComb <- map_dfr(plotDatComb, function(x){x}, .id = "feat") %>% 
+    mutate(feat = factor(feat, levels = feats),
+            group = factor(group, levels = c("Functional score", featureGroups)))
+ggplot(plotDatComb, aes(x = ID, y = val, fill = group, colour = group)) + 
+        geom_col(width = 1, size = 0.235) + 
+        comfy_theme(include_xaxis = F) +
+        theme(panel.border = element_rect(colour = "#5c5c5c", fill = NA, size = 0.235),
+                axis.text.x = element_text(size = 6, colour = "black"),
+                axis.text.y = element_text(size = 6, colour = "black")) +
+        scale_x_discrete(breaks = spacing[!is.na(spacing)]) +
+        labs(x = "Position", y = "val")  + 
+        facet_wrap(~feat, ncol = 1, scales = "free") + 
+        scale_fill_manual(values = featureGroupFills_wScore) + 
+        scale_colour_manual(values = featureGroupCols_wScore)
+ggsave_pdfpng(file = "output/images/functional_scores/examples/FANCD2/bar_scoresfeats_FANCD2", width = 3.5, height = 4.5)
+```

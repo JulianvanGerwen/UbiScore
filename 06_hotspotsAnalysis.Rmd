@@ -1,0 +1,309 @@
+# Background
+Here I analyse the results of hotspot analysis
+
+# Initialise
+```{r}
+library(DT)
+library(tidyverse)
+library(purrr)
+library(ggplot2)
+library(seqinr)
+library(data.table)
+library(UniProt.ws)
+up <- UniProt.ws()
+library(Biostrings)
+library(openxlsx)
+
+home_directory <- ""
+source(paste0(home_directory, "scripts/essential_visualisations_JvG.R"))
+source(paste0(home_directory, "scripts/enrichment_analysis_JvG.R"))
+source("scripts/00_objects.R")
+source("scripts/01_general.R")
+
+
+#Load data
+load("data/hotspots/hotspotDf__3.RData")
+load("data/hotspots/hotspotDomainDf__3.RData")
+load("data/hotspots/hotspotSites__3.RData")
+hotspotResRep_repOnly <- read_csv("output/data/hotspots/domains/representativeStrs/hotspotResidueOutput_strRep.csv") %>%
+  as.data.frame 
+load("data/PSP/PSP_reg_ubCorr__3.RData")
+```
+
+## Annotate hotspot sites with ubi-site features and PSP info
+```{r}
+load("data/features/ubiFeatProc__1.RData")
+
+#Set up hotspot sites
+##Rename
+colnames(hotspotSites) <- paste0("HotspotNew_", colnames(hotspotSites))
+hotspotSites <- hotspotSites %>% 
+  dplyr::rename("uniprot_pos" = "HotspotNew_uniprot_pos")
+length(unique(hotspotSites$uniprot_pos))
+colnames(hotspotSites)
+#Add hotspot sites to features
+ubiFeatProc_hspot <- left_join(ubiFeatProc, hotspotSites, by = "uniprot_pos") %>%
+  mutate(HotspotNew_bool = !is.na(HotspotNew_hotspot_id))
+table(ubiFeatProc_hspot$HotspotNew_bool)
+
+#Add PSP info
+ubiFeatProc_hspot <- left_join(ubiFeatProc_hspot, 
+                                 PSP_reg_ubCorr[, c("uniprot_site",
+                                                    setdiff(colnames(PSP_reg_ubCorr), colnames(ubiFeatProc_hspot)))], 
+                                 by = "uniprot_site")
+
+# Get gene names
+library(AnnotationDbi)
+library(org.Hs.eg.db)
+collapser <- function(x){
+  if (is.na(x[1])){
+    return(NA)
+  } else {
+    return(paste(x, collapse = ";"))
+  }
+}
+geneMap <- AnnotationDbi::select(org.Hs.eg.db, keys = unique(ubiFeatProc_hspot$uniprot), keytype = "UNIPROT", columns = c("SYMBOL")) %>% 
+  group_by(UNIPROT) %>% summarise(SYMBOL = collapser(SYMBOL), .groups = "drop") 
+ubiFeatProc_hspot <- left_join(ubiFeatProc_hspot, dplyr::rename(geneMap, "uniprot" = "UNIPROT", "gene" = "SYMBOL"), by = "uniprot")
+```
+
+
+
+# Plot hotspots
+```{r}
+pvalConversion <- read.table("output/data/hotspots/domains/hotspotOutput/pvalConversion.txt")
+adjpCutoff <- 0.01/pvalConversion[1, 1]
+logpCutoff <- -log10(adjpCutoff)
+
+
+for (tempDomain in unique(hotspotResRep_repOnly$domain)){
+  #Naming
+  domainName <- hotspotDf$interpro_name[which(hotspotDf$domain == tempDomain)[1]]
+  
+  # Subset and add nlogp
+  plotDat <- hotspotResRep_repOnly %>%
+    filter(domain == tempDomain, !is.na(position_representative)) %>%
+    mutate(nlogp = -log10(pvals)) %>%
+    #Add something for enrichment
+   mutate(enrichment = foreground - bg_means) %>%
+    mutate(enrichment = ifelse(enrichment < 0, 0, enrichment))
+  
+  # Choose which variable is primary (here nlogp) and compute scaling factor
+  # so that the maximum of nlogp corresponds to the maximum of enrichment.
+  scaleFactor <- max(plotDat$nlogp, na.rm = TRUE) / max(plotDat$enrichment, na.rm = TRUE)
+  
+  # Create a scaled version of 'enrichment' to overlay on the same plot
+  plotDat <- plotDat %>%
+    mutate(enrichment_scaled = enrichment * scaleFactor)
+  
+  # Call hotspots. This come from the "hotspot" argument +-2 amino acid
+  hotspotPosAln_uncorr <- subset(hotspotResRep_repOnly, domain == tempDomain & hotspot == T)$position_aln
+  hotspotPosAln_corr <- map(-2:2, ~(hotspotPosAln_uncorr + .)) %>% unlist %>% unique
+  plotDat_sorted <- plotDat %>% arrange(position_representative)
+  condition <- plotDat_sorted$position_aln %in% hotspotPosAln_corr
+  rle_results <- rle(condition)
+  ends <- cumsum(rle_results$lengths)
+  starts <- c(1, head(ends, -1) + 1)
+  
+  # Create a data.frame to store x-axis intervals (from position_representative)
+  segments <- data.frame()
+  for (i in seq_along(rle_results$values)) {
+    if (rle_results$values[i]) {
+      seg <- data.frame(
+        xmin = plotDat_sorted$position_representative[starts[i]],
+        xmax = plotDat_sorted$position_representative[ends[i]]
+      )
+      segments <- rbind(segments, seg)
+    }
+  }
+  if (nrow(segments) > 0){
+    rectPlot <- geom_rect(data = segments, aes(xmin = xmin, xmax = xmax),
+              ymin = 0, ymax = Inf, fill = "#eee98a", alpha = 1,
+              inherit.aes = FALSE)
+  } else {
+    rectPlot <- NULL
+  }
+  # Create the plot with two geoms: one for nlogp and one for enrichment
+  ggplot(plotDat, aes(x = position_representative)) +
+    #Yellow rectangles in background
+    rectPlot +
+    geom_line(aes(y = enrichment_scaled, colour = "enrichment"), size = 0.235) +
+    # Primary axis: nlogp
+    geom_line(aes(y = nlogp, colour = "nlogp"), size = 0.235) +
+    scale_y_continuous(
+      name = "-log10 p-value", 
+      # Inverse transformation so that the secondary axis shows the original enrichment values.
+      sec.axis = sec_axis(~ . / scaleFactor, name = "Ubi-sites (normalized)")
+    ) +
+    # Significance line
+    geom_hline(yintercept = logpCutoff, colour = "#545554", size = 0.235, linetype = "dashed", alpha = 0.7) +
+    # Themes and axes
+    scale_colour_manual(name = "Variable", values = hotspotLineColours) +
+    comfy_theme(include_legend = F) + theme(axis.title.x = element_blank()) +
+    theme(panel.border = element_rect(color = "black", fill = NA, linewidth = 0.235)) +
+    ggtitle(paste0(tempDomain, " ", domainName))
+  ggsave_pdfpng(file = paste0("output/images/hotspots/hotspotTraces/hspotTrace_", tempDomain, sep = ""),
+                width = 3, height = 1.3)
+}
+```
+
+# Overview of hotspot sites
+```{r}
+#Number of hotspot sites per domain
+table(hotspotSites$HotspotNew_interpro_name) %>% sort(., decreasing = T) %>% as.matrix
+
+#Numbers
+print("# hotspot domains")
+print(length(unique(hotspotDf$domain)))
+print("# hotspots")
+print(length(unique(hotspotDf$hotspot_id)))
+print("# human hotspot sites")
+subset(hotspotSites, HotspotNew_scientific_name == "Homo sapiens")$HotspotNew_uniprot_site %>% unique %>% length
+```
+
+Number of kinases with the hotspot site
+```{r}
+subset(hotspotSites, HotspotNew_hotspot_id == "IPR000719_946" & HotspotNew_scientific_name == "Homo sapiens")$HotspotNew_uniprot %>% unique %>% length
+```
+
+
+## Export summary of hotspots for supp table 
+```{r}
+hotspotSumm <- hotspotDf
+
+# Add # sites
+hotspotSitesSumm <- hotspotSites[, c("HotspotNew_uniprot_site", "HotspotNew_hotspot_id", "HotspotNew_scientific_name")] %>% 
+  separate_rows("HotspotNew_hotspot_id", sep = ";") %>% 
+  group_by(HotspotNew_hotspot_id) %>% 
+  summarise(numSites = n(), numSitesHs = sum(HotspotNew_scientific_name == "Homo sapiens"))
+hotspotSumm <- left_join(hotspotSumm, 
+  dplyr::rename(hotspotSitesSumm, "hotspot_id" = "HotspotNew_hotspot_id"), 
+  by = "hotspot_id")
+
+# Format and export
+renameCols <- c(
+  "hotspot_id" = "Hotspot ID",
+  "domain" = "Domain (Interpro)",
+  "interpro_name" = "Domain name",
+  "interpro_nameShort" = "interpro_nameShort",
+  "pfam" = "Domain (pfam)",
+  "start_aln" = "Start position in alignment",
+  "end_aln" = "End position in alignment",
+  "min_adj_pval" = "Minimum adj. p-value",
+  "strRep" = "Representative structure",
+  "numSites" = "Number of ubi-sites",
+  "numSitesHs" = "Number of human ubi-sites"
+)
+hotspotSumm_exp <- hotspotSumm[, names(renameCols)] %>% 
+  dplyr::rename(!!!setNames(names(renameCols), renameCols))
+outDir = "output/data/hotspots/SuppTable_hotspots.xlsx"
+sheet = "hotspotSummary"
+if (file.exists(outDir)){
+  wb <- loadWorkbook(outDir)
+} else {
+  wb <- createWorkbook(outDir)
+}
+removeWorksheet(wb, sheet)
+addWorksheet(wb, sheet)
+writeData(wb, sheet = sheet, x = hotspotSumm_exp)
+saveWorkbook(wb, outDir, overwrite = TRUE)
+```
+
+## Export list of sites
+```{r}
+renameCols <- c(
+  "HotspotNew_uniprot_site" = "Ubi-site",
+  "HotspotNew_scientific_name" = "Species",
+  "HotspotNew_hotspot_id" = "Hotspot ID",
+  "HotspotNew_domain" = "Domain (Interpro)",
+  "HotspotNew_interpro_name" = "Domain name",
+  "HotspotNew_interpro_nameShort" = "interpro_nameShort",
+  "HotspotNew_pfam" = "Domain (pfam)"
+)
+hotspotSites_exp <- hotspotSites[, names(renameCols)] %>% 
+  dplyr::rename(!!!setNames(names(renameCols), renameCols))
+outDir = "output/data/hotspots/SuppTable_hotspots.xlsx"
+sheet = "hotspotSites"
+if (file.exists(outDir)){
+  wb <- loadWorkbook(outDir)
+} else {
+  wb <- createWorkbook(outDir)
+}
+removeWorksheet(wb, sheet)
+addWorksheet(wb, sheet)
+writeData(wb, sheet = sheet, x = hotspotSites_exp)
+saveWorkbook(wb, outDir, overwrite = TRUE)
+```
+
+
+# Annotated regulatory sites
+```{r}
+#Inspect enrichment
+##Set up
+regCols <- c("PSP_reg_ProtDeg", "PSP_reg_otherFunc", "PSP_reg")
+
+hotspotBinSumm <- catBoolSummariser(data = ubiFeatProc_hspot, catCol = "HotspotNew_bool",
+                  boolCols = regCols)
+hotspotBinSumm %>% pivot_longer(cols = paste0(regCols, "_enr"), names_to = "type", values_to = "perc") %>%
+  mutate(type = gsub("_enr$", "", type)) %>% mutate(type = factor(type, levels = regCols)) %>%
+  ggplot(., aes(x = HotspotNew_bool, y = perc, fill = type)) +
+  geom_col(position = position_dodge2()) +
+  geom_hline(yintercept = 1, size = 0.235, linetype = "dashed") +
+  comfy_theme() +
+  labs(x = "In hotspot", y = "Fold enrichment (over all ubn sites)")
+ggsave_pdfpng(file = "output/images/features/conservation/bplot_hotspotBool_PSPreg_enr",
+              width = 3, height = 2)
+##Fisher's exact
+###Non-degradation
+fishers_DE_pathway(background_genes = ubiFeatProc_hspot$uniprot_site, 
+                    DE_genes = subset(ubiFeatProc_hspot, HotspotNew_bool == T)$uniprot_site, 
+                    pathway_genes = subset(ubiFeatProc_hspot, PSP_reg_otherFunc == T)$uniprot_site)
+###Degradation
+fishers_DE_pathway(background_genes = ubiFeatProc_hspot$uniprot_site, 
+                    DE_genes = subset(ubiFeatProc_hspot, HotspotNew_bool == T)$uniprot_site, 
+                    pathway_genes = subset(ubiFeatProc_hspot, PSP_reg_ProtDeg == T)$uniprot_site)
+
+#Inspecting annotated regulatory sites
+##Format for export
+outputCols <- c(
+  "uniprot_site",
+  colnames(ubiFeatProc_hspot)[grep("^HotspotNew_", colnames(ubiFeatProc_hspot))],
+  colnames(PSP_reg_ubCorr)
+) %>% unique
+hotspotsSitesPSP <- ubiFeatProc_hspot %>%
+  subset(HotspotNew_bool == T & PSP_reg == T) %>%
+  .[, c(outputCols)] %>%
+  .[order(.$HotspotNew_hotspot_id), ]
+##Export
+write.csv(hotspotsSitesPSP, file = "output/data/hotspots/hotspots_PSPreg.csv", na = "")
+
+#Export remaining domains
+remainingDoms <- subset(hotspotDf, hotspot_id %in% hotspotsSitesPSP$HotspotNew_hotspot_id == F) %>%
+  .[, c("domain", "pfam", "hotspot_id", "interpro_name", "interpro_nameShort")]
+write.csv(remainingDoms, file = "output/data/hotspots/hotspots_notPSPreg.csv", na = "")
+
+strsplit(hotspotsSitesPSP$HotspotNew_hotspot_idwName, ";") %>% unlist %>% table %>% sort(., decreasing = T) %>% as.matrix
+
+# Export for supp table
+renameCols = c(
+  "uniprot_site" = "Ubi-site",
+  "GENE" = "GENE",
+  "HotspotNew_hotspot_id" = "Hotspot ID",
+  "HotspotNew_interpro_name" = "Domain name",
+  "ON_FUNCTION" = "Ubi-site function (PhosphositePlus)",
+  "ON_PROCESS" = "Ubi-site process (PhosphositePlus)"
+)
+hotspotsSitesPSP_exp <- hotspotsSitesPSP[, names(renameCols)] %>% 
+  dplyr::rename(!!!setNames(names(renameCols), renameCols))
+outDir = "output/data/hotspots/SuppTable_hotspots.xlsx"
+sheet = "hotspotRegulatorySites"
+if (file.exists(outDir)){
+  wb <- loadWorkbook(outDir)
+} else {
+  wb <- createWorkbook(outDir)
+}
+removeWorksheet(wb, sheet)
+addWorksheet(wb, sheet)
+writeData(wb, sheet = sheet, x = hotspotsSitesPSP_exp)
+saveWorkbook(wb, outDir, overwrite = TRUE)
+```

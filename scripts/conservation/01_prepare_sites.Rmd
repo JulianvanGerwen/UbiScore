@@ -1,0 +1,70 @@
+# Background
+Here I prepare sites for conservation analysis
+You need to run 02_PRIDE_build.Rmd first to get the mapping 
+from the PRIDE uniprot-based sites to ENSP
+
+# Initialise
+```{r}
+setwd(dirname(rstudioapi::getActiveDocumentContext()$path)) # Set working directory to source file location
+library(DT)
+library(tidyverse)
+library(purrr)
+library(ggplot2)
+library(openxlsx)
+```
+
+# Get non-human sites 
+I load these from the ubn-omics data 
+```{r}
+# Load non-human ubn omics sites
+ubnOmicsSites <- read_csv(file = "../../data/features/ubnOmics/ensp_site_canonical.csv")
+omics_sites_nonhs <- ubnOmicsSites %>% 
+    subset(scientific_name != "Homo sapiens") %>% 
+    .[, c("scientific_name", "ensp", "position")] %>% distinct
+# They are now already in the correct format: scientific_name, ensp, position
+
+# Export for supp table
+omics_sites_nonhs_exp <- omics_sites_nonhs
+renameCols <- c(
+    "scientific_name" = "Species",
+    "ensp" = "Protein identifier (ENSEMBL)",
+    "position" = "Ubi-site position"
+)
+omics_sites_nonhs_exp <- omics_sites_nonhs_exp[, names(renameCols)] %>% 
+    dplyr::rename(!!setNames(names(renameCols), renameCols))
+outDir = "../../output/data/ubnOmics/SuppTable_panSpeciesOmics.xlsx"
+sheet = "panSpeciesSites"
+if (file.exists(outDir)){
+  wb <- loadWorkbook(outDir)
+} else {
+  wb <- createWorkbook(outDir)
+}
+removeWorksheet(wb, sheet)
+addWorksheet(wb, sheet)
+writeData(wb, sheet = sheet, x = omics_sites_nonhs_exp)
+saveWorkbook(wb, outDir, overwrite = TRUE)
+```
+
+
+
+# Get human sites
+```{r}
+load("../../data/PRIDE/PRIDE_uniprotToEnsp__3.RData")
+PRIDE_ensp <- PRIDE_uniprotToEnsp %>% 
+    mutate(scientific_name = "Homo sapiens") %>% 
+    subset(!is.na(ensp_pos)) %>%  #Remove sites that couldn't be mapped 
+    distinct %>% 
+    mutate(ensp = gsub("_.+$", "", ensp_pos), 
+           position = gsub("^.+_", "", ensp_pos)) %>% 
+    .[, c("scientific_name", "ensp", "position")] %>% 
+    distinct
+```
+
+
+# Combine and export
+```{r}
+all_sites_ptmdb <- rbind(PRIDE_ensp, omics_sites_nonhs)
+table(all_sites_ptmdb$scientific_name)
+
+write_delim(all_sites_ptmdb, file = "data/all_sites_ptmdb.tab", delim = "\t")
+```

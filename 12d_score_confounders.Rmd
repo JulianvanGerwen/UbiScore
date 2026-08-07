@@ -1,0 +1,380 @@
+# Background
+Here I analyse factors that could be confounding the score and its association with other things of interest.
+In particular, I look at protein abundance and protein turnover
+
+
+# Initialise
+```{r}
+library(tidyverse)
+library(purrr)
+library(ggplot2)
+library(ggridges)
+library(readxl)
+library(openxlsx)
+
+home_directory <- ""
+source(paste0(home_directory, "scripts/essential_visualisations_JvG.R"))
+source(paste0(home_directory, "scripts/enrichment_analysis_JvG.R"))
+source("scripts/01_general.R")
+source("scripts/00_objects.R")
+source("scripts/04_ubnOmics.R")
+
+#Load data
+load("data/functional_scores/ubiFeatPreds__7.RData")
+load("data/features/ubnOmics/ubnOmicsFeauresAll__4.RData")
+load("data/features/ubnOmics/ubnOmicsComp_hsPRIDE_lst__8.RData")
+
+
+#Set up bin breaks for the functional score, and other aesthetic paramters
+funcScoreBreaks <- c(0, 0.2, 0.4, 0.6, 0.8, 1)
+funcScoreBinCols <- brewer.pal(9, "Blues")[c(1, 3, 5, 7, 9)]
+funcScoreFillAlpha <- 0.3
+
+#Get gene identifiers for our ubi sites
+library(AnnotationDbi)
+library(org.Hs.eg.db)
+collapseFunc <- function(x){
+    x <- unique(x)
+    if (is.na(x[1])){
+        return(NA)
+    } else {
+        return(paste(x, collapse = ";"))
+    }
+}
+geneMap <- AnnotationDbi::select(org.Hs.eg.db, keys = unique(ubiFeatPreds$uniprot), keytype = "UNIPROT",
+                                    columns = c("SYMBOL")) %>% 
+                                group_by(UNIPROT) %>% 
+                                summarise(gene = collapseFunc(SYMBOL))
+ubiFeatPreds <- left_join(ubiFeatPreds, dplyr::rename(geneMap, "uniprot" = "UNIPROT"), by = "uniprot")
+##Expand out by gene when they are not unique
+ubiFeatPreds_byGene <- separate_rows(ubiFeatPreds, "gene", sep = ";") %>% 
+                        mutate(gene_site = paste(gene, site, sep = "_")) 
+```
+
+## Add proteasome inhibition data
+```{r}
+# Add prtsm inhib data
+prtsmInhibCols <- c("Bortezomib_meanlog2FC", "MG-132_meanlog2FC", "Epoxomicin_meanlog2FC")
+if (length(intersect(prtsmInhibCols, colnames(ubiFeatPreds))) == 0){
+    ubiFeatPreds <- left_join(ubiFeatPreds, ubnOmicsFeaturesAll[, c("uniprot_pos", prtsmInhibCols)],
+                                by = "uniprot_pos")
+}
+```
+
+# Protein and site abundance 
+## Prep data
+```{r}
+load("data/features/abundDat__1.RData")
+abundDat$uniprot_pos <- gsub("_K", "_", rownames(abundDat))
+abundFeatsLog <- colnames(abundDat) %>% .[grep("log$", .)]
+ubiFeatPreds <- left_join(ubiFeatPreds, abundDat[, c(abundFeatsLog, "uniprot_pos")], by = "uniprot_pos")
+```
+
+## log-transform features so they match training
+```{r}
+logFeats <- c(
+  "mutR_am_pathogenicity_all",
+  
+  "PSP_numAdj21",
+  
+  "numQuant_all",
+  
+  "numReg_notPrtsm"
+
+  
+)
+
+for (col in logFeats){
+  if (sum(ubiFeatPreds[, col] == 0, na.rm = TRUE) > 0){
+    ubiFeatPreds[, col] <- log(1 + ubiFeatPreds[, col]) #Avoid NA for 0 values
+  } else {
+    ubiFeatPreds[, col] <- log(ubiFeatPreds[, col])
+  }
+}
+```
+
+## Correlate the score and model features with abundance measures
+```{r}
+# Set up aesthetics
+library(viridis)
+colScale <- c(seq(0, 0.25, length.out = 6 + 1)[-1], 
+            seq(0.25, 0.7, length.out = 5 + 1)[-1], 1) 
+hexScale <- scale_fill_gradientn(colours = viridis(10), 
+                        values = rescale(colScale, c(0, 1)), 
+                        limits = c(1, NA), name = "# sites")
+
+# Define features
+abunMets <- c("protAbundance_log", "PSMcounts_log")
+feats <- c("functional_score", featureCols)
+
+# Helper functions
+removeExtremeOutliers <- function(dat, vars, sdCutoff = 10){
+    keep <- rep(TRUE, nrow(dat))
+    for (var in vars){
+        x <- dat[[var]]
+        if (!is.numeric(x)){
+            next
+        }
+        xMean <- mean(x, na.rm = TRUE)
+        xSd <- sd(x, na.rm = TRUE)
+        if (is.na(xSd) || xSd == 0){
+            next
+        }
+        keep <- keep & (is.na(x) | abs(x - xMean) <= sdCutoff * xSd)
+    }
+    dat[keep, ]
+}
+
+isBooleanVar <- function(x){
+    x <- x[!is.na(x)]
+    if (length(x) == 0){
+        return(FALSE)
+    }
+    all(unique(x) %in% c(TRUE, FALSE, 0, 1))
+}
+
+# Plot
+for (abunMet in abunMets){
+    pltLst <- list()
+    for (feat in feats){
+        # Remove extreme outliers for the variables being plotted
+        plotDat <- removeExtremeOutliers(ubiFeatPreds, c(abunMet, feat))
+
+        # Plot continuous features as hex plots and boolean features as boxplots
+        if (isBooleanVar(plotDat[[feat]])){
+            plotDat[[feat]] <- factor(plotDat[[feat]])
+            plt <- ggplot(plotDat, aes(y = !!sym(abunMet), x = !!sym(feat))) +
+                geom_boxplot(outlier.shape = NA, size = 0.235) +
+                comfy_theme()
+        } else {
+            corVal <- cor(plotDat[[abunMet]], plotDat[[feat]], use = "complete.obs")
+            corLabel <- paste0("R = ", signif(corVal, 3))
+            plt <- ggplot(plotDat, aes(y = !!sym(abunMet), x = !!sym(feat))) + 
+                geom_hex(bins = 50) +
+                geom_smooth(method = "lm", se = TRUE, color = "red", linewidth = 0.235, alpha = 0.3) +
+                annotate("text", x = Inf, y = Inf, label = corLabel, hjust = 1.1, vjust = 1.1, size = 4) +
+                hexScale +
+                comfy_theme()
+        }
+        pltLst[[feat]] <- plt
+    }
+    ggarrange(plotlist = pltLst)
+    ggsave_pdfpng(file = paste0("output/images/functional_scores/abundance/hex_modelFeats_", abunMet),
+                    width = 2.25*5, height = 2*4)
+}
+```
+
+## Bin protein abundance and compare to prtsmi 
+```{r}
+# Bin protein abundance
+binN <- 10
+ubiFeatPreds$protAbundance_log_bins <- cut_number(ubiFeatPreds$protAbundance_log, binN)
+ubiFeatPreds$protAbundance_log_binsLab <- ubiFeatPreds$protAbundance_log_bins
+levels(ubiFeatPreds$protAbundance_log_binsLab) <- paste0("Abun", 1:binN)
+
+# Visualise score distribution in each bin
+ggplot(ubiFeatPreds, aes(x = functional_score)) + 
+    geom_histogram() + 
+    comfy_theme() + 
+    facet_wrap(~protAbundance_log_binsLab)
+```
+
+
+
+## Bin functional score and compare to prtsmi, coloured by abundance bin
+```{r}
+# Bin functional_score into 5 fixed-width bins
+funcScoreBinBreaks <- c(0, 0.2, 0.4, 0.6, 0.8, 1.0)
+ubiFeatPreds$functional_score_bins <- cut(ubiFeatPreds$functional_score, breaks = funcScoreBinBreaks, include.lowest = TRUE)
+ubiFeatPreds$functional_score_binsLab <- ubiFeatPreds$functional_score_bins
+levels(ubiFeatPreds$functional_score_binsLab) <- paste0("Score", 1:5)
+
+# FC boxplot function (duplicated from 09_regulation_vs_conservation.Rmd)
+box_FCs <- function(
+  dat,
+  logFCcol = "log2FC",
+  xCol = "consBox_LysCont",
+  colourCol = "protAbundance_log_binsLab",
+  yLims = c(-2, 3),
+  hlineInts = c(-1, 0, 1)
+){
+  # Prep data
+  dat <- dat %>% .[rowSums(is.na(.[, c(logFCcol, xCol, colourCol)])) == 0,  ] %>%
+    as.data.frame
+  ## Combine columns to make one x-axis
+  dat <- dat %>% .[order(.[, colourCol], .[, xCol]), ] %>%
+    mutate(xFact = paste(!!sym(colourCol), !!sym(xCol), sep = "__")) %>%
+    mutate(xFact = factor(xFact, levels = unique(xFact)))
+
+  ## Calculate numbers to show above violins
+  dataNums <- dat %>%
+    group_by(xFact) %>%
+    summarise(num = n(), .groups = "drop")
+  ## Calculate y value for number annotations
+  dataNums$y <- max(yLims) * 0.9
+
+  # Plot
+  plt <- ggplot(dat, aes(x = xFact, y = !!sym(logFCcol), color = !!sym(colourCol), fill = !!sym(colourCol))) +
+    geom_boxplot(outlier.shape = NA, size = 0.235, alpha = 0.2, coef = 0, width = 0.7) +
+    geom_hline(yintercept = hlineInts, size = 0.235, linetype = "dashed", alpha = 0.5) +
+    geom_text(data = dataNums, aes(x = xFact, y = y, label = num),
+                          size = 1.875 * 3 / 5, colour = "black",
+                          position = position_dodge2(width = 0.9),
+                          inherit.aes = F) +
+    comfy_theme(rotate_x_text = T) +
+    theme(axis.text.x = element_text(colour = "black",size = 5, hjust = 1, vjust = 1, angle = 45),
+          axis.title.x = element_blank()) +
+    lims(y = yLims)
+  return(plt)
+}
+
+# Plot: one boxplot per treatment, x = functional_score bin, colour = abundance bin
+pltLst <- map(prtsmInhibCols, function(treatCol){
+  plt <- box_FCs(
+                dat = ubiFeatPreds,
+                logFCcol = treatCol,
+                xCol = "functional_score_binsLab") +
+      ggtitle(treatCol)
+  return(plt)
+})
+ggarrange(plotlist = pltLst, nrow = 3)
+ggsave_pdfpng(file = "output/images/functional_scores/abundance/box_scoreBinAbunBin_prtmsi", width = 0.6*10, height = 2*3)
+```
+
+
+
+
+
+# Protein half life (Mathieson et al)
+```{r}
+# Load table (defaults to the "protein half lives high qual" sheet, which is
+# already pre-filtered by the authors on fit R_sq; dataQual ("good"/"weak") is
+# a separate, per-replicate quality call that we filter on below)
+TableS2 <- read_xlsx(path = paste0(home_directory, "data/supplementary_tables/Mathieson_NatComms_2018/Table_S2.xlsx"))
+```
+
+```{r}
+# Reshape to one row per gene x cell line x replicate
+halfLifeLong <- TableS2 %>%
+  pivot_longer(cols = -gene_name,
+               names_to = c("cellLine", "replicate", "measure"),
+               names_pattern = "^(.*) replicate (\\d+) (half_life|dataQual|R_sq)$",
+               values_to = "value",
+               values_transform = list(value = as.character)) %>%
+  mutate(cellLine = trimws(gsub(",$", "", cellLine))) %>%
+  pivot_wider(names_from = measure, values_from = value) %>%
+  mutate(half_life = as.numeric(half_life),
+         R_sq = as.numeric(R_sq))
+
+# Number of (per-replicate) values per cell line before filtering
+nBefore <- halfLifeLong %>%
+  group_by(cellLine) %>%
+  summarise(n_before = sum(!is.na(half_life)), .groups = "drop")
+
+# Keep only high-quality replicates, then average remaining replicates per gene x cell line
+halfLifeFilt <- halfLifeLong %>%
+  mutate(half_life = ifelse(dataQual == "good", half_life, NA)) %>%
+  group_by(gene_name, cellLine) %>%
+  summarise(half_life = mean(half_life, na.rm = TRUE), .groups = "drop") %>%
+  mutate(half_life = ifelse(is.nan(half_life), NA, half_life))
+
+# Number of values per cell line after filtering + collapsing replicates
+nAfter <- halfLifeFilt %>%
+  group_by(cellLine) %>%
+  summarise(n_after = sum(!is.na(half_life)), .groups = "drop")
+
+# Summary: values per cell line before vs. after filtering + collapsing
+halfLifeSumm <- full_join(nBefore, nAfter, by = "cellLine")
+```
+
+```{r}
+# log10-transform and reshape to one row per gene, one column per cell line
+halfLifeFilt$log10_half_life <- log10(halfLifeFilt$half_life)
+halfLifeWide <- halfLifeFilt %>%
+  dplyr::select(gene_name, cellLine, log10_half_life) %>%
+  pivot_wider(names_from = cellLine, values_from = log10_half_life)
+cellLineCols <- setdiff(colnames(halfLifeWide), "gene_name")
+halfLifeWide$Average <- rowMeans(halfLifeWide[, cellLineCols], na.rm = TRUE)
+halfLifeWide$Average[is.nan(halfLifeWide$Average)] <- NA
+
+# Cell line vs cell line correlation matrix (QC)
+cor(halfLifeWide[, cellLineCols], use = "pairwise.complete.obs")
+```
+
+```{r}
+# Map half lives into a copy of ubiFeatPreds, matching gene_name to gene
+halfLifeCols <- paste0("halfLife_", c(cellLineCols, "Average"))
+halfLifeWide_prefixed <- halfLifeWide %>% rename_with(~paste0("halfLife_", .), -gene_name)
+ubiFeatPreds_wHalfLife <- left_join(ubiFeatPreds, halfLifeWide_prefixed, by = c("gene" = "gene_name"))
+```
+
+```{r}
+# Correlation (with p-value and n) of each log half-life source to each model feature
+corDat <- expand_grid(halfLifeSource = halfLifeCols, feat = feats) %>%
+  pmap_dfr(function(halfLifeSource, feat){
+    x <- ubiFeatPreds_wHalfLife[[halfLifeSource]]
+    y <- as.numeric(ubiFeatPreds_wHalfLife[[feat]])
+    n <- sum(!is.na(x) & !is.na(y))
+    ct <- if (n >= 3) cor.test(x, y) else NULL
+    tibble(halfLifeSource = halfLifeSource, feat = feat,
+           cor = if (!is.null(ct)) unname(ct$estimate) else NA_real_,
+           pval = if (!is.null(ct)) ct$p.value else NA_real_,
+           n = n)
+  })
+
+subset(corDat, feat %in% c("functional_score", "numQuant_all", "numReg_notPrtsm", "FinalBoxProcNum")) %>% View
+```
+
+## Turnover (half-life) correlations by cell line
+```{r}
+featsSel <- c("functional_score", "numQuant_all", "numReg_notPrtsm", "FinalBoxProcNum")
+corDatSel <- subset(corDat, feat %in% featsSel) %>%    
+    mutate(feat = factor(feat, levels = featsSel))
+
+corDatCellLines <- subset(corDatSel, halfLifeSource != "halfLife_Average") 
+corDatMean <- corDatCellLines %>% group_by(feat) %>% summarise(cor = mean(cor, na.rm = TRUE), .groups = "drop")
+
+ggplot(corDatMean, aes(x = feat, y = cor)) +
+    geom_col(size = 0.235, colour = "black", fill = "grey", alpha = 0.7) +
+    geom_point(data = corDatCellLines, shape = 16, size = 1) +
+    comfy_theme(rotate_x_text = TRUE) +
+    labs(title = "Half-life correlation (Mathieson et al. 2018)", y = "Pearson's R")
+ggsave_pdfpng(file = "output/images/functional_scores/abundance/bar_halfLifeCor_byCellLine",
+                width = 1.65, height = 2.3)
+```
+
+## Bin average protein half-life and compare to prtsmi
+```{r}
+# Bin average protein half-life
+binN <- 10
+ubiFeatPreds_wHalfLife$halfLife_Average_bins <- cut_number(ubiFeatPreds_wHalfLife$halfLife_Average, binN)
+ubiFeatPreds_wHalfLife$halfLife_Average_binsLab <- ubiFeatPreds_wHalfLife$halfLife_Average_bins
+levels(ubiFeatPreds_wHalfLife$halfLife_Average_binsLab) <- paste0("Turnover", 1:binN)
+
+# Visualise score distribution in each bin
+ggplot(ubiFeatPreds_wHalfLife, aes(x = functional_score)) +
+    geom_histogram() +
+    comfy_theme() +
+    facet_wrap(~halfLife_Average_binsLab)
+
+# Correlate within each bin
+plotLst <- list()
+k <- 1
+datLst <- ubiFeatPreds_wHalfLife %>% subset(!is.na(halfLife_Average_binsLab)) %>%
+    split(.$halfLife_Average_binsLab)
+for (treatCol in prtsmInhibCols){
+    for (i in 1:length(datLst)){
+        plt <- ggplot(datLst[[i]], aes(x = functional_score, y = !!sym(treatCol))) +
+            geom_hex(bins = 20) +
+            geom_hline(yintercept = 0, linewidth = 0.235) +
+            geom_smooth(method = "lm", se = TRUE, color = "red", linewidth = 0.235, alpha = 0.3) +
+            hexScale +
+            comfy_theme() + ggtitle(names(datLst)[i])
+        plotLst[[k]] <- plt
+        k <- k + 1
+    }
+}
+ggarrange(plotlist = plotLst, nrow = 3, ncol = 10)
+ggsave_pdfpng(file = "output/images/functional_scores/abundance/hex_halfLifeBin_score_prtsmi",
+                width = 10*2.5, height = 3*2)
+```

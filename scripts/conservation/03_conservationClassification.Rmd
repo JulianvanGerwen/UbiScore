@@ -1,0 +1,254 @@
+# Background
+Here I calculate conservation levels from the compara alignment results
+
+
+# Initialise
+```{r}
+setwd(dirname(rstudioapi::getActiveDocumentContext()$path)) # Set working directory to source file location
+library(tidyverse)
+library(purrr)
+library(data.table)
+
+
+home_directory <- ""
+source(paste0(home_directory, "scripts/essential_visualisations_JvG.R"))
+
+#Directory for results from ptmAge code
+ubiAgeDir <- ""   # Directory with my results
+speciesTag <- "PRIDE" # Tag used to identify results
+```
+
+
+# Load data 
+My data
+```{r}
+# Table of all sites with their gene families and alignment positions
+ancest <- read_delim(paste0(ubiAgeDir, "results\\all_origins_", speciesTag, "_w0.tab")) %>% as.matrix
+
+# Map from genes to their directories
+map <- read_delim(paste0(ubiAgeDir, "temp\\Gene_to_tree_file_human.txt"), col_names = F) %>% as.data.frame
+## Trim directories (user-specific)
+CORRECTIONTAG <- ""
+map[, 3] <- gsub(CORRECTIONTAG, "", map[, 3], fixed = TRUE)
+map <- as.matrix(map)
+```
+
+# Clean ancest data
+```{r}
+####Clean the spaces in the column variable and create an IDposition like identifier for site recognition
+ancest[,"column"]=gsub(" ","",ancest[,"column"])
+ancest[,"position"]=gsub(" ","",ancest[,"position"])
+ancest=cbind(paste(ancest[,"family"],ancest[,"column"],sep="_"),ancest)
+colnames(ancest)[1]="ID"
+ancest=cbind(ancest,paste(ancest[,"gene"],ancest[,"position"],sep="_K"))
+colnames(ancest)[ncol(ancest)]="IDpos"
+
+######We select all alignments which includes human sequences
+ancest.homo=ancest[grep("Homo",ancest[,"species"]),]
+
+######Overview for sanity check
+# Human sites
+dim(ancest.homo)
+length(unique(ancest.homo[, "IDpos"]))
+sum(is.na(ancest.homo[, "family"]))
+# Non-human sites
+ancest %>% as.data.frame %>% subset(species != "Homo sapiens") %>% .[, "species"] %>% table
+```
+
+
+
+## Collapse sites
+I use my faster implementation
+```{r}
+column <- ancest %>% as.data.frame %>% group_by(ID) %>%  
+    summarise(
+        Aligned.sites.count = n(),
+        Organisms = paste(species, collapse = ";"),
+        IDpos = paste(IDpos, collapse = ";")
+        #common_ancestor_name = paste(common_ancestor_name, collapse = ";")
+    ) %>% ungroup %>% 
+    subset(Aligned.sites.count > 1)  %>% 
+    as.matrix
+
+###Filtering all sites for human
+column.human=column[grep("Homo",column[,"Organisms"]),]
+View(column.human)
+```
+
+# Prepare the map
+```{r}
+###Lines to finaly calculate the boxes 
+###Includes the one to navigate the subfolder system that the script has created with the alignments
+
+###This first part creates arrangements to navigate the system I was working at, tunned as required
+new.map=map[!duplicated(map[,2]),2:3]
+colnames(new.map)=c("family","path")
+new.map[, "path"] <- paste0(new.map[, "path"], "/", speciesTag, "/region_w0/", new.map[, "family"],"_ptm_continue_region_w0.txt")
+```
+
+
+# Navigating through the map to collect alignment data
+```{r}
+##Geting ready fo rthe final big tab
+
+# Subset for gene families with PTMs
+## This is done by using the "ancest" file, which has PTMs as rows
+new.map=new.map[new.map[,"family"]%in%ancest[,"family"],]
+```
+
+```{r}
+# Set up arguments to read in and manipulate data
+argList <- list()
+for (i in 1:nrow(new.map)){
+  argList[[i]] <- c(new.map[i, "path"], new.map[i, "family"])
+}
+# Loop and read in data
+primerLst <- list()
+for (i in 1:length(argList)){
+  if (i %% 100 == 0){
+    print(i)
+  }
+  args <- argList[[i]]
+  path <- args[1]
+  family <- args[2]
+  dat <- read.delim(path)
+  datLong <- pivot_longer(dat, cols = -Gene)
+  datLong$family <- family
+  primerLst[[i]] <- datLong
+}
+# Combine
+primer <- rbindlist(primerLst) %>% 
+  dplyr::rename("gene" = "Gene", "column" = "name")
+primer$column <- gsub("^X", "", primer$column)
+primer$ID <- paste(primer$family, primer$column, sep = "_")
+primer <- as.matrix(primer)
+```
+
+
+# Assign species (looks at gene naming)
+```{r}
+##Annotate with organism names based on ID features
+
+primer=cbind(primer,"")
+
+colnames(primer)[ncol(primer)]="species"
+
+primer[grep("ENSP",primer[,"gene"]),"species"]="Homo sapiens"
+primer[grep("ENSMUSP",primer[,"gene"]),"species"]="Mus musculus"
+primer[grep("ENSRNOP",primer[,"gene"]),"species"]="Rattus norvegicus"
+primer[grep("ENSGALP",primer[,"gene"]),"species"]="Gallus gallus"
+primer[grep("ENSECAP",primer[,"gene"]),"species"]="Equus caballus"
+primer[grep("ENSDARP",primer[,"gene"]),"species"]="Danio rerio"
+primer[grep("ENSXETP",primer[,"gene"]),"species"]="Xenopus tropicalis"
+primer[grep("FBpp",primer[,"gene"]),"species"]="Drosophila melanogaster"
+
+primer[primer[,"species"]=="","species"]="Rest"
+```
+
+
+# Assign boxes 
+## Set up
+```{r}
+# Set up
+primerDf <- data.frame(primer) %>% 
+  mutate(value = as.numeric(value))
+column.humanDf <- as.data.frame(column.human)
+ancest.homoDf <- as.data.frame(ancest.homo)
+
+# Get human sites that also have mouse/rat or other species sites
+MRposID <- column.humanDf[
+  grepl("Mus", column.humanDf$Organisms) | 
+  grepl("Rattus", column.humanDf$Organisms), 
+  "ID"]
+MRposID <- unique(MRposID)
+CDWYposID <- column.humanDf[
+  grepl("Gallus", column.humanDf$Organisms) | 
+  grepl("Drosophila", column.humanDf$Organisms) |
+  grepl("Caenorhabditis", column.humanDf$Organisms) | 
+  grepl("Saccharomyces", column.humanDf$Organisms), 
+  "ID"]
+CDWYposID <- unique(CDWYposID)
+MRE_lys <- unique(subset(primerDf, # All IDs with mouse/rat/horse acceptors 
+  species %in% c("Mus musculus", "Rattus norvegicus", "Equus caballus") & 
+  value == 0.5)$ID)  
+anyNoLys <- unique(subset(primerDf, value == 0)$ID)  # Sites with no lys in any gene in any species
+otherSpecies_lys <- unique(subset(primerDf, # All IDs with a lysine in other species
+  species %in% c("Homo sapiens", "Mus musculus", "Rattus norvegicus", "Equus caballus") == F &
+  value > 0)$ID)
+
+# Asign different values to ancest.homoDf
+ancest.homoDf$hasUbi_MR <- ancest.homoDf$ID %in% MRposID
+ancest.homoDf$hasUbi_CDWY <- ancest.homoDf$ID %in% CDWYposID
+ancest.homoDf$hasLys_MRE <- ancest.homoDf$ID %in% MRE_lys
+ancest.homoDf$hasLys_CDWYetc <- ancest.homoDf$ID %in% otherSpecies_lys
+ancest.homoDf$hasUbi_hsOnly <- !(ancest.homoDf$hasUbi_CDWY) & !(ancest.homoDf$hasUbi_MR)
+```
+
+## Ubi-sites + Lysine content
+### Calculate
+```{r}
+# Calculate % lysine content for non-human sites
+primerDfnoHs <- subset(primerDf, species != "Homo sapiens")
+nonHsLysContent <- primerDfnoHs %>% group_by(ID) %>% 
+  summarise(totalNum = n(), lysNum = sum(value > 0)) %>% ungroup %>% 
+  mutate(lysContent = lysNum / totalNum * 100)
+subset(nonHsLysContent, is.na(lysContent)) %>% View
+# Map in
+ancest.homoDf <- left_join(ancest.homoDf, nonHsLysContent, by = "ID")
+ancest.homoDf$lysContent[which(is.na(ancest.homoDf$lysContent))] <- 0 # Set to 0 for sites with only human genes in alignment
+```
+
+
+### Define categories based on lysine content
+```{r}
+# Function to filter for lysine content
+lysContFilt <- function(data, hasUbi_MR, hasUbi_CDWY, lysContent){
+  bool <- (data$hasUbi_MR == hasUbi_MR) &  #Ubi-site filtering
+    (data$hasUbi_CDWY == hasUbi_CDWY) & 
+    (data$lysContent >= lysContent[1]) &  # Lysine content lower bound
+    (data$lysContent < lysContent[2])   # Lysine content upper bound
+}
+lysContGroups <- list(
+  "Level1" = lysContFilt(ancest.homoDf, F, F, c(0, 10)),
+  "Level2" = lysContFilt(ancest.homoDf, F, F, c(10, 50)),
+  "Level3" = lysContFilt(ancest.homoDf, F, F, c(50, 101)),
+  "Level4" = lysContFilt(ancest.homoDf, T, F, c(0, 101)),
+  "Level5" = lysContFilt(ancest.homoDf, T, T, c(0, 101))
+)
+ancest.homoDf$LevelsLyscont <- NA 
+for (i in 1:length(lysContGroups)){
+  ancest.homoDf$LevelsLyscont[lysContGroups[[i]]] <- names(lysContGroups)[i]
+}
+```
+
+
+
+# Map back to uniprot and export
+```{r}
+# Load identifier map
+load("../../data/PRIDE/PRIDE_uniprotToEnsp__3.RData")
+
+# Map
+ancest.homoDfMapped <- ancest.homoDf %>% 
+  mutate(ensp_pos = paste(gene, position, sep = "_")) %>% 
+  left_join(., PRIDE_uniprotToEnsp, by = "ensp_pos") %>% 
+  mutate(uniprot_site = gsub("_", "_K", uniprot_pos))
+
+# Rename
+conservationBoxesDf <- ancest.homoDfMapped %>% 
+  dplyr::rename("consBox_v1" = "FinalBox",
+                "consBox_LysCont" = "LevelsLyscont")
+
+# Collapse redundancy at the level of uniprot_site
+## Order so that we always pick the highest conservation box when given a choice
+conservationBoxesDfUniq <- conservationBoxesDf[order(conservationBoxesDf$consBox_LysCont, decreasing = T), ]
+## Collapse at the level of uniprots
+conservationBoxesDfUniq <- conservationBoxesDfUniq %>% 
+  group_by(uniprot_site) %>% 
+  summarise(across(everything(), ~ first(.))) %>% 
+  ungroup
+
+# Export
+save(conservationBoxesDf, file = "results/conservationBoxesDf__1.RData")
+save(conservationBoxesDfUniq, file = "results/conservationBoxesDfUniq__1.RData")
+```

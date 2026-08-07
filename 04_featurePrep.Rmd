@@ -1,0 +1,625 @@
+# Background
+Here I annotate the PRIDE human ubi-sites with features that I later use for functional score training
+
+
+## Checklist - things that need to be run manually
+- Get VEPs and interface residues - scripts/11_VEP.py
+- Disorder, surface accessibility, and secondary structure - run NetSurfP3.0
+- Protein domains, motifs etc - run uniprot API call (this script)
+
+
+
+
+# Initialise
+```{r}
+library(tidyverse)
+library(purrr)
+library(ggplot2)
+
+home_directory <- ""
+source(paste0(home_directory, "scripts/essential_visualisations_JvG.R"))
+source("scripts/01_general.R")
+source("scripts/03_visualisations.R")
+
+#Load data
+load("data/PSP/PSP_reg_ubCorr__3.RData")
+
+# Set up a log to track missing data in various features
+featLog = list()
+```
+
+Load in relevant proteomes
+```{r}
+##Function: read in a fasta file of protein sequences and convert them into a data frame
+library(seqinr)
+read_fastaseq <- function(directory){
+  seqs_raw <- read.fasta(directory)
+  seqs <- data.frame("sequence" = map(seqs_raw, ~paste(., collapse = "")) %>% unlist)
+  seqs$sequence <- toupper(seqs$sequence)
+  seqs$uniprotkb <- strsplit(rownames(seqs), "\\|") %>% map(~.[2]) %>% unlist
+  return(seqs)
+}
+##Load proteomes with cache
+prtmCacheDir <- "output/data/proteomes/"
+prtmRealDir <-  paste0(home_directory, "data/biol_databases/uniprot/")
+# Iso
+cacheF <- paste0(prtmCacheDir, "uniprotkb_proteome_UP000005640_2025_02_19", ".RData")
+if (file.exists(cacheF)){
+  load(cacheF)
+} else {
+  uniprotHsIso <- read_fastaseq(paste(prtmRealDir, 
+    "uniprotkb_proteome_UP000005640_2025_02_19", ".fasta", sep = ""))
+  save(uniprotHsIso, file = cacheF)
+}
+# Iso revi
+cacheF <- paste0(prtmCacheDir, "uniprotkb_proteome_UP000005640_AND_revi_2025_02_19", ".RData")
+if (file.exists(cacheF)){
+  load(cacheF)
+} else {
+  uniprotHsIsoRevi <- read_fastaseq(paste(prtmRealDir, 
+    "uniprotkb_proteome_UP000005640_AND_revi_2025_02_19", ".fasta", sep = ""))
+  save(uniprotHsIsoRevi, file = cacheF)
+}
+```
+
+
+# Load and prep the PRIDE build
+```{r}
+processBuild <- function(data){
+  dataProc <- data %>%
+    mutate(uniprot = strsplit(Protein, "|", fixed = T) %>% map(~.[2]) %>% unlist,
+           unipGene = strsplit(Protein, "|", fixed = T) %>% map(~.[3]) %>% unlist) %>%
+    mutate(site = paste0(PTM_residue, Protein_pos)) %>%
+    mutate(uniprot_site = paste(uniprot, site, sep = "_"),
+           uniprot_pos = paste(uniprot, Protein_pos, sep = "_")) %>%
+    #Remove A decoys
+    subset(PTM_residue != "A") %>%
+    as.data.frame
+  return(dataProc)
+}
+#buildPos - No redundant sites. This is what I use
+buildPos <- read_csv("data/PRIDE/DATE/G2S1B_0.05_protein_pos_single_prot_mapping.csv") %>% processBuild
+#buildPosAllprots
+buildPosAllprots <- read_csv("data/PRIDE/DATE/G2S1B_0.05_protein_pos_all_prot_mapping.csv") %>% processBuild
+
+# Define data to use
+ubiFeatRaw <- buildPos %>% as.data.frame %>% 
+  dplyr::rename(pos = Protein_pos)
+
+#Set up a subsetted proteome
+uniprotHsIsoSub <- subset(uniprotHsIso, uniprotkb %in% ubiFeatRaw$uniprot)
+```
+
+## Get sequence windows from uniprot
+```{r}
+# Are all uniprots present?
+table(ubiFeatRaw$uniprot %in% uniprotHsIsoSub$uniprotkb)
+setdiff(ubiFeatRaw$uniprot, uniprotHsIsoSub$uniprotkb)
+## Filter out those that are not present (only 2 proteins and 22 sites)
+ubiFeatRaw <- subset(ubiFeatRaw, uniprot %in% uniprotHsIsoSub$uniprotkb)
+
+# Extract sequence windows
+## Set up caching: load existing cache or initialise a new one to store computed results for unipAA and unipSeqWind
+cache_file <- "output/data/unipSeqWindCache.rds"
+if (file.exists(cache_file)) {
+  resCache <- readRDS(cache_file)
+} else {
+  resCache <- list()
+}
+## Process each unique protein and cache the results per position
+uniqProteins <- unique(ubiFeatRaw$uniprot)
+for (up in uniqProteins) {
+  idx <- which(ubiFeatRaw$uniprot == up)
+  # If not already cached, compute the results for all positions of this protein
+  if (!(up %in% names(resCache))) {
+    seq_raw <- uniprotHsIsoSub$sequence[which(uniprotHsIsoSub$uniprotkb == up)]
+    padded_seq <- paste(c(rep("_", 7),
+                          seq_raw,
+                          rep("_", 7)), collapse = "")
+    positions <- ubiFeatRaw$pos[idx]
+    unipAA_vals <- sapply(positions, function(pos) {
+      if (pos <= str_length(padded_seq) - 14) {
+         substr(padded_seq, pos + 7, pos + 7)
+      } else { 
+         NA 
+      }
+    })
+    unipSeqWind_vals <- sapply(positions, function(pos) {
+      if (pos <= str_length(padded_seq) - 14) {
+         substr(padded_seq, pos, pos + 14)
+      } else { 
+         NA 
+      }
+    })
+    resCache[[up]] <- data.frame(pos = positions,
+                                 unipAA = unipAA_vals,
+                                 unipSeqWind = unipSeqWind_vals,
+                                 stringsAsFactors = FALSE)
+  }
+}
+
+# Use cache results all at once
+resCacheDf <- map_dfr(resCache, function(x){x}, .id = "uniprot") %>% 
+  mutate(uniprot_pos = paste(uniprot, pos, sep = "_"))
+ubiFeatProc <- left_join(ubiFeatRaw, resCacheDf[, c("uniprot_pos", "unipAA", "unipSeqWind")], by = "uniprot_pos")
+
+# Save/Update the cache for future runs
+saveRDS(resCache, file = cache_file)
+
+# Check sequences
+## Anything missing?
+table(is.na(ubiFeatProc$unipAA))
+## Anything not lysine?
+table(ubiFeatProc$unipAA)
+subset(ubiFeatProc, unipAA != "K") %>% View
+
+# Filter out missing and not lysine
+ubiFeatProc <- subset(ubiFeatProc, !is.na(unipAA) & unipAA == "K")
+nrow(ubiFeatProc)
+nrow(buildPos)
+```
+
+
+
+# Map in PhosphositePlus annotations
+```{r}
+PSP_reg_ubSub <- subset(PSP_reg_ubCorr, uniprot_site %in% ubiFeatProc$uniprot_site)
+
+#Big numbers
+print("# of PSP sites")
+print(nrow(PSP_reg_ubCorr))
+print("# of PSP sites in Inigo's sites")
+print(nrow(PSP_reg_ubSub))
+
+#Different functions
+PSP_reg_ub_FUNC <- split_ON_FUNCTION(PSP_reg_ubSub) 
+##Number of unique sites per ON_FUNCTION
+onFuncSum <- PSP_reg_ub_FUNC %>% split(.$ON_FUNCTION_strp) %>% map(~unique(.$uniprot_site)) %>% map_dbl(~length(.)) %>% as.data.frame
+colnames(onFuncSum)[1] <- "numSites"
+onFuncSum$FUNCTION <- rownames(onFuncSum)
+##Plot
+ggplot(subset(onFuncSum, numSites > 10), 
+       aes(x = reorder(FUNCTION, numSites, decreasing = TRUE), 
+           y = numSites)) +
+  geom_bar(stat = "identity") +
+  comfy_theme(include_xaxis = F, rotate_x_text = T) +
+  xlab("Function") +
+  ylab("# ubn sites") +
+  ggtitle("Regulatory ubn sites")
+ggsave_pdfpng(file = "output/images/overview/bplot_InigoOverlap_ubnFuncs",
+              width = 3, height = 2.25)
+
+#Degradation vs other functions
+##Flag in inigo's data
+protDegSites <- subset(PSP_reg_ub_FUNC, ON_FUNCTION_strp == "protein degradation")$uniprot_site
+otherFuncSites <- subset(PSP_reg_ub_FUNC, ON_FUNCTION_strp != "protein degradation")$uniprot_site
+ubiFeatProc$PSP_reg <- ubiFeatProc$uniprot_site %in% PSP_reg_ubSub$uniprot_site
+ubiFeatProc$PSP_reg_ProtDeg <- ubiFeatProc$uniprot_site %in% protDegSites
+ubiFeatProc$PSP_reg_otherFunc <- ubiFeatProc$uniprot_site %in% otherFuncSites
+ubiFeatProc$PSP_reg_notProtDeg <- ubiFeatProc$uniprot_site %in% setdiff(otherFuncSites, protDegSites)
+ubiFeatProc$PSP_reg_ProtDegOnly <- ubiFeatProc$uniprot_site %in% setdiff(protDegSites, otherFuncSites)
+
+cols <- colnames(ubiFeatProc) %>% .[grep("^PSP_", .)]
+for (col in cols){
+  print(col)
+  print(sum(ubiFeatProc[, col]))
+}
+```   
+
+# Prepare and inspect PRIDE confidence
+```{r}
+ubiFeatProc$PRIDE_set <- factor(ubiFeatProc$PTM_FLR_category, levels = c("Bronze", "Silver", "Gold"))
+table(ubiFeatProc$PRIDE_set)
+
+#Inspect for PSP regulatory sites
+PRIDESetSumm <- catBoolSummariser(data = ubiFeatProc, catCol = "PRIDE_set",
+                  boolCols = c("PSP_reg_ProtDeg", "PSP_reg_otherFunc", "PSP_reg"))
+PRIDESetSumm %>% pivot_longer(cols = c("PSP_reg_ProtDeg_pct", "PSP_reg_otherFunc_pct"), names_to = "type", values_to = "perc") %>%
+  ggplot(., aes(x = PRIDE_set, y = perc, fill = type)) +
+  geom_col(position = position_dodge2()) +
+  comfy_theme() +
+  labs(x = "PRIDE confidence", y = "% of site group")
+ggsave_pdfpng(file = "output/images/features/PRIDE/bplot_boxes_PSPreg",
+              width = 3, height = 2)
+```
+
+
+# Map in conservation boxes
+```{r}
+load("data/conservation/conservationBoxesDfUniq__1.RData")
+conservationBoxesDfUniq_filt <- conservationBoxesDfUniq %>% 
+  .[, c("uniprot_site", "ensp_pos", "consBox_LysCont", "consBox_v1")] %>% 
+  dplyr::rename("Cons_ensp_pos" = "ensp_pos" )
+# Add to features
+ubiFeatProc <- left_join(ubiFeatProc, conservationBoxesDfUniq_filt, by = "uniprot_site")
+# Overview
+table(!is.na(ubiFeatProc$consBox_LysCont))
+table(ubiFeatProc$consBox_LysCont)
+```
+
+
+# Protein abundance from PaxDB
+```{r}
+#Map in paxDB data
+load(paste0(home_directory, "data/biol_databases/PaxDB/20250320/9606/9606-WHOLE_ORGANISM-integrated_mappedFID.RData"))
+
+#Get uniprot id
+uniprotHsIso$unip_id <- strsplit(rownames(uniprotHsIso), "|", fixed = T) %>% map(~.[3]) %>% unlist 
+ubiFeatProc <- left_join(ubiFeatProc, uniprotHsIso[, c("uniprotkb", "unip_id")] %>% dplyr::rename("uniprot" = "uniprotkb"))
+
+#Map abundance based on this
+ubiFeatProc <- left_join(ubiFeatProc, paxDBunipid[, c("abundance", "unip_id")])
+
+# Overview
+table(!is.na(ubiFeatProc$abundance))
+```
+
+
+
+
+# Get VEPs and interface sites
+```{r}
+#Set up mutations
+muts <- list(
+  "R" = paste(ubiFeatProc$uniprot_site, "R", sep = "") %>% gsub("_", "/", .),
+  "A" = paste(ubiFeatProc$uniprot_site, "A", sep = "") %>% gsub("_", "/", .)
+)
+mutsDf <- data.frame("variant_id" = unlist(muts))
+write.csv(mutsDf, file = "output/data/VEP/ubnVariants.csv")
+
+#HERE YOU NEED TO RUN ubnVariants.csv through the VEP script: scripts/11_VEP.py
+
+# Load in results
+mutsDfVEP_merged <- read_csv("output/data/VEP/ubnVariantsVEP_merged.csv") %>% as.data.frame %>% .[, -1]
+
+# Flag what is missing
+VEPmissingSites <- setdiff(ubiFeatProc$uniprot_site, mutsDfVEP_merged$uniprot_site)
+featLog[["VEP"]] <- list(
+  "status" = ifelse(length(VEPmissingSites) == 0, "All sites covered", paste0(length(VEPmissingSites), " sites missing")),
+  "missingSites" = VEPmissingSites
+)
+
+# Add to data
+ubiFeatProc <- left_join(ubiFeatProc, mutsDfVEP_merged, by = "uniprot_site")
+
+# Overview of coverage
+colSums(is.na(ubiFeatProc[, c("mutR_am_class_all", "interface_label", "mutR_ESM1b_LLR")]))
+```
+
+
+# Protein length and related
+```{r}
+#Protein length
+uniprotHsIsoSub$length <- str_length(uniprotHsIsoSub$sequence)
+rownames(uniprotHsIsoSub) <- uniprotHsIsoSub$uniprotkb
+ubiFeatProc$proteinLength <- factor(ubiFeatProc$uniprot)
+levels(ubiFeatProc$proteinLength) <- uniprotHsIsoSub[levels(ubiFeatProc$proteinLength), "length"]
+ubiFeatProc$proteinLength <- as.numeric(as.character(ubiFeatProc$proteinLength))
+#Distance from C and N termini
+ubiFeatProc <- mutate(ubiFeatProc, 
+                        distN = pos,
+                        distC = proteinLength - pos + 1) %>%
+  mutate(distNFrac = distN / proteinLength,
+         distCFrac = distC / proteinLength)
+
+#Inspect for PSP sites
+combDat <- makeCombDat(ubiFeatProc)
+vars <- c("proteinLength", "distN", "distC")
+for (var in vars){
+  plt <- ViolBoxplot(data = combDat, vars = list(x = "group", y = var, colour = "group")) +
+    scale_y_log10()
+  plot(plt)
+  ggsave_pdfpng(file = paste0("output/images/features/structure/viol_", var, "_PSPreg"),
+              width = 3.5, height = 2)
+}
+
+```
+
+
+
+# NetSurfP3.0: Disorder, surface accessibility, and secondary structure
+Here I export sequences to be run through NetSurfP3.0. I then load in the results 
+Many steps of this are slow (e.g. reading in many small files), so I use caches 
+to speed it up
+### Prepare and filter sequences
+```{r}
+# Get sequences to run
+library(Biostrings)
+seqDat <- subset(uniprotHsIsoSub, length <= 5000)
+seqDat$sequence <- gsub("U", "C", seqDat$sequence) #Change selenocysteine to cysteine
+
+# Get sites that should be run
+preNSPsites <- ubiFeatProc[, c("uniprot", "uniprot_site", "uniprot_pos", "pos")] %>% 
+  subset(uniprot %in% seqDat$uniprotkb)
+```
+
+### Load in results (including cache) and export missing sequences
+```{r}
+# Load in cache
+cacheF <- "output/data/structure/NSPdat_forUbn_cache.RData"
+if (file.exists(cacheF)){
+  load(cacheF)  # Data is called NSPdat
+} else {
+  NSPdat <- NULL
+}
+# Check sites that are not in the cache
+preNSPsitesMissing <- subset(preNSPsites, uniprot_pos %in% NSPdat$uniprot_pos == F)
+
+# Make map to existing result files
+outputBatchDir <- "output/data/structure"
+outputBatches <- dir(outputBatchDir) %>% .[grep("^batch\\d+$", .)]
+unipDirDf <- map_dfr(outputBatches, function(f){
+  batchDir <- file.path(outputBatchDir, f, "01")
+  unipFiles <- dir(batchDir) %>% .[grep("^\\d+_", .)]
+  unipFilesFull <- paste0(outputBatchDir, "/", f, "/01/", unipFiles, "/", unipFiles, ".csv")
+  unipFilesDf <- data.frame("uniprot" = gsub("^\\d+_", "", unipFiles), "fDir" = unipFilesFull)
+}, .id = "batch")
+## Flag uniprots that are missing - need to be rerun
+## Do this based on the results map, not cache
+missingUnips <- unique(setdiff(preNSPsitesMissing$uniprot, unipDirDf$uniprot))
+
+# Export sequences for uniprots that need to be rerun, in batches
+## Get existing batches
+#batchOutDir <- "output/data/structure"
+#existingBatches <- dir(batchOutDir) %>% .[grep("UbnUnipSeqs_batch\\d+\\.fasta", .)] %>% 
+#  gsub("UbnUnipSeqs_batch", "", .) %>% gsub(".fasta", "", ., fixed = T) %>% as.numeric
+existingBatches <- outputBatches %>% gsub("^batch", "", .) %>% as.numeric
+## Make new batches, max size 4900
+if (length(missingUnips) > 0){
+  newBatches <- split(missingUnips, ceiling(seq_along(missingUnips) / 4900))
+  newBatchIDs <- 1:length(newBatches) + max(existingBatches)
+  for (i in 1:length(newBatchIDs)){
+    seqDatSub <- subset(seqDat, uniprotkb %in% newBatches[[i]])
+    fasta_seqs <- BStringSet(seqDatSub$sequence)
+    names(fasta_seqs) <- seqDatSub$uniprotkb
+    writeXStringSet(fasta_seqs, paste0("output/data/structure/UbnUnipSeqs_batch", newBatchIDs[i],  ".fasta"))
+  }
+}
+
+##### HERE YOU NEED TO RUN NSP3 ON ANY NEW BATCHES #####
+# conda activate nsp3
+# python nsp3.py -m models/nsp3.pth -i (input file) -o (output file)
+# Load in results for missing sites
+## Subet for missing sites where the uniprots have results
+preNSPsitesMissing_wRes <- subset(preNSPsitesMissing, uniprot %in% unipDirDf$uniprot)
+## Read in results for new sites by looping over uniprots
+if (nrow(preNSPsitesMissing_wRes) > 0){
+  NSPdatNewLst <- list()
+  for (unip in unique(preNSPsitesMissing_wRes$uniprot)){
+    ## Get posns
+    posns <- subset(preNSPsitesMissing_wRes, uniprot == unip)$pos
+    ## Load in NSP data
+    resDir <- unipDirDf$fDir[which(unipDirDf$uniprot == unip)[1]]
+    dat <- read_csv(resDir)
+    datSub <- subset(dat, n %in% posns) %>% as.data.frame
+    NSPdatNewLst[[unip]] <- datSub
+  }
+  NSPdatNew <- purrr::reduce(NSPdatNewLst, rbind)
+  NSPdatNew <- NSPdatNew %>% 
+    mutate(uniprot = gsub("^>", "", id)) %>%
+    mutate(uniprot_pos = paste(uniprot, n, sep = "_")) %>%
+    dplyr::select(-c("id", "seq", "n"))
+  inds <- which(colnames(NSPdatNew) != "uniprot_pos")
+  colnames(NSPdatNew)[inds] <- paste0("NSP_", colnames(NSPdatNew)[inds])
+} else {
+  NSPdatNew <- NULL
+}
+## Process and add to cache
+NSPdat <- rbind(NSPdat, NSPdatNew) %>% distinct
+save(NSPdat, file = cacheF)
+```
+
+### Add to table and check what is still missing
+```{r}
+# Add to data
+ubiFeatProc <- left_join(ubiFeatProc, NSPdat, by = "uniprot_pos")
+
+# Flag anything still missing
+NSPmissingSites <- setdiff(preNSPsites$uniprot_pos, NSPdat$uniprot_pos)
+featLog[["NSP"]] <- list(
+  "status" = ifelse(length(NSPmissingSites) == 0, "All sites covered", paste0(length(NSPmissingSites), " sites missing")),
+  "missingSites" = NSPmissingSites
+)
+```
+
+
+### Explore results
+```{r}
+#Overview
+table(!is.na(ubiFeatProc$NSP_asa))
+
+#Inspect for PSP sites
+combDat <- makeCombDat(ubiFeatProc)
+vars <- c("NSP_rsa", "NSP_disorder", "NSP_p[q3_H]", "NSP_p[q3_E]", "NSP_p[q3_C]")
+for (var in vars){
+  plt <- ViolBoxplot(data = combDat, vars = list(x = "group", y = var, colour = "group")) +
+    scale_y_log10() +
+    ggtitle(var)
+  plot(plt)
+  ggsave_pdfpng(file = paste0("output/images/features/structure/viol_", var, "_PSPreg"),
+              width = 3.5, height = 2)
+}
+```
+
+
+
+# Protein domains
+## Set up input
+```{r}
+# Set up input uniprots
+preDomainUnips <- uniprotHsIsoSub$uniprotkb
+
+# Load cache
+cacheF <- "output/data/structure/domainDat_cache.RData"
+if (file.exists(cacheF)){
+  load(cacheF)  # Data is called domainDatRaw
+} else {
+  domainDatRaw <- NULL
+}
+# Define missing uniprots
+preDomainUnipsMissing <- setdiff(preDomainUnips, rownames(domainDatRaw))
+```
+
+## Run domain extraction on missing results 
+```{r}
+library(UniprotR)
+if (length(preDomainUnipsMissing) > 0){
+  # Make batches of <= 100 uniprots, to help with internet connection
+  v <- preDomainUnipsMissing
+  batch_size <- 100
+  nBatches <- ceiling(length(v) / batch_size)
+  batches <- split(v, ceiling(seq_along(v) / batch_size))
+  lst <- list()
+  i <- 1
+  # Run uniprotR domain extraction on batches
+  while (i <= nBatches){
+    dat <- GetFamily_Domains(batches[[i]])
+    if (!is.null(dat)){
+      lst[[i]] <- dat
+      i <- i + 1
+    }
+  }
+  domainDatRawNew <- purrr::reduce(lst, rbind)
+  domainDatRawNew <- domainDatRawNew[which(rownames(domainDatRawNew) %in% rownames(domainDatRaw) == F), ]
+} else {
+  domainDatRawNew <- NULL
+}
+
+# Update cache
+domainDatRaw <- rbind(domainDatRaw, domainDatRawNew)
+save(domainDatRaw, file = cacheF)
+```
+
+## Extract results
+```{r}
+#Process domain annotations + similar
+domainProcessArgs <- list(
+  c("Domain..FT.", "DOMAIN", "domain"),
+  c("Compositional.bias", "COMPBIAS", "compbias"),
+  c("Motif", "MOTIF", "motif"),
+  c("Region", "REGION", "region"),
+  c("Repeat", "REPEAT", "repeat"),
+  c("Zinc.finger", "ZN_FING", "znFing")
+)
+for (x in domainProcessArgs){
+  domainDat <- filter(domainDatRaw, !is.na(!!sym(x[1]))) %>% as.data.frame
+  #Process annotations
+  annot <- domainDat[, x[1]]
+  annot <- gsub(paste0("^", x[2], " "), "", annot)
+  posns <- strsplit(annot, paste0("; ", x[2], " ")) %>% map(function(vec){
+    vec <- gsub(";.+$", "", vec)
+    vec <- gsub(">", "", vec) # Sometimes this in the entry e.g. A0A0B4J1U4: 18..>118; /note=Ig-like; /evidence=ECO:0000255|PROSITE-ProRule:PRU00114
+    vec <- vec[!grepl("-", vec)] #Remove matches that are only for isoform uniprots
+    vec <- vec[!grepl("?", vec, fixed = T)] #Remove matches that have ?
+    if (length(vec) == 0){
+      return(NULL)
+    } else {
+      vecSplt <- strsplit(vec, "..", fixed = T)
+      sequence <- map(vecSplt, function(y){
+        if (length(y) == 1){
+          return(as.numeric(y))
+        } else {
+          return(y[1]:y[2])
+        }
+      }) %>% unlist
+      return(sequence)
+    }
+  })
+  names(posns) <- rownames(domainDat)
+  posns <- posns[map(posns, ~!is.null(.)) %>% unlist]
+  
+  #Identify ubn sites in annotated regions
+  ubnSitesLst <- ubiFeatProc %>% split(.$uniprot) %>% map(~.$pos)
+  sitesInDomains <- map2(posns, names(posns), function(domain, unip){
+    sites <- ubnSitesLst[[unip]]
+    int <- intersect(sites, domain)
+    if (length(int) == 0){
+      return(NULL)
+    } else {
+      return(paste(unip, int, sep = "_"))
+    }
+  }) %>% unlist
+  ubiFeatProc[, paste0("UNIPROT_in_", x[3])] <- ubiFeatProc$uniprot_pos %in% sitesInDomains
+}
+
+ubiFeatProc %>% .[, grep("^UNIPROT_", colnames(.))] %>% colSums
+
+
+#Inspect for PSP regulatory sites
+UNIPROTCols <- colnames(ubiFeatProc) %>% .[grep("^UNIPROT_", .)]
+names(UNIPROTCols) <- UNIPROTCols
+UNIPROTSumm <- map(UNIPROTCols, function(col){
+  dat <- filter(ubiFeatProc, !is.na(!!sym(col)))
+  catBoolSummariser(data = dat, catCol = col,
+                  boolCols = c("PSP_reg_ProtDeg", "PSP_reg_otherFunc", "PSP_reg"))
+})
+map2(UNIPROTSumm, names(UNIPROTSumm), function(summ, col){
+  summ %>% pivot_longer(cols = c("PSP_reg_ProtDeg_pct", "PSP_reg_otherFunc_pct"), names_to = "type", values_to = "perc") %>%
+    ggplot(., aes(x = !!sym(col), y = perc, fill = type)) +
+    geom_col(position = position_dodge2()) +
+    comfy_theme(rotate_x_text = T) +
+    labs(x = col, y = "% of site group")
+  ggsave_pdfpng(file = paste0("output/images/features/structure/bplot_", col, "_PSPreg"),
+                width = 3, height = 2)
+})
+```
+
+
+# PTMs at the same position
+```{r}
+#Load PSP data for all modifications
+PSPDir <- paste(home_directory, "data/biol_databases/phosphosite_plus/DATE", sep = "")
+Fs <- dir(PSPDir) %>% .[grep("_dataset$", .)]
+PSPCombDat <- map(Fs, function(f){
+  PSP_raw <- read_delim(file.path(PSPDir, f)) %>%
+    as.data.frame
+  PSP_sub <- subset(PSP_raw, ORGANISM == "human" & ACC_ID %in% ubiFeatProc$uniprot) %>%
+    mutate(mod = gsub("^.+-", "", MOD_RSD),
+           site = gsub("-.+$", "", MOD_RSD)) %>%
+    mutate(pos = as.numeric(gsub("[A-Z]", "", site))) %>%
+    mutate(uniprot_pos = paste(ACC_ID, pos, sep = "_"),
+           uniprot_site = paste(ACC_ID, site, sep = "_")) %>%
+    dplyr::select("ACC_ID", "mod", "site", "pos", "uniprot_pos", "uniprot_site")
+  return(PSP_sub)
+}) %>% purrr::reduce(rbind)
+
+#Number of other lysine modifications at the same position
+PSPCombDat_KnotUb <- subset(PSPCombDat, mod != "ub" & grepl("^K", site))
+ubiFeatProc$PSP_numOtherLysMod <- map(ubiFeatProc$uniprot_site, ~length(which(PSPCombDat_KnotUb$uniprot_site == .))) %>% unlist
+
+
+#Inspect for PSP sites
+combDat <- makeCombDat(ubiFeatProc)
+vars <- c("PSP_numOtherLysMod")
+for (var in vars){
+  plt <- ViolBoxplot(data = combDat, vars = list(x = "group", y = var, colour = "group")) +
+    #scale_y_log10() +
+    ggtitle(var)
+  plot(plt)
+  ggsave_pdfpng(file = paste0("output/images/features/PTMs/viol_", var, "_PSPreg"),
+              width = 3.5, height = 2)
+}
+
+ubiFeatProc$PSP_boolOtherLysMod <- ubiFeatProc$PSP_numOtherLysMod > 0
+catBoolSummariser(data = ubiFeatProc, catCol = "PSP_boolOtherLysMod",
+                  boolCols = c("PSP_reg_ProtDeg", "PSP_reg_otherFunc", "PSP_reg"))
+```
+
+
+
+# Export
+```{r}
+save(ubiFeatProc, file = "output/data/features/ubiFeatProc__1.RData")
+```
+
+
+
+
+
+
+
+
+
+
+
+

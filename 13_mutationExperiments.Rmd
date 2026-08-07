@@ -1,0 +1,452 @@
+# Background
+Here I process and prepare experimental data of ubiquitin site mutations in yeast.
+
+# Initialise
+```{r}
+library(tidyverse)
+library(purrr)
+library(ggplot2)
+library(readxl)
+library(openxlsx)
+
+home_directory <- ""
+source(paste0(home_directory, "scripts/essential_visualisations_JvG.R"))
+source("scripts/01_general.R")
+source("scripts/00_objects.R")
+source("scripts/03_visualisations.R")
+source("scripts/04_ubnOmics.R")
+
+load("data/functional_scores/ubiFeatPreds__7.RData")
+load("data/features/ubnOmics/ubnOmicsComp_hsPRIDE_lst__8.RData")
+```
+
+Load in proteomes
+```{r}
+##Function: read in a fasta file of protein sequences and convert them into a data frame
+library(seqinr)
+read_fastaseq <- function(directory){
+  seqs_raw <- read.fasta(directory)
+  seqs <- data.frame("sequence" = map(seqs_raw, ~paste(., collapse = "")) %>% unlist)
+  seqs$sequence <- toupper(seqs$sequence)
+  seqs$uniprotkb <- strsplit(rownames(seqs), "\\|") %>% map(~.[2]) %>% unlist
+  return(seqs)
+}
+#Load human proteomes
+uniprotHsIso <- read_fastaseq(paste(home_directory, 
+                                        "data/biol_databases/uniprot/uniprotkb_proteome_UP000005640_2025_02_19.fasta", sep = ""))
+uniprotHsIsoRevi <- read_fastaseq(paste(home_directory, 
+                                        "data/biol_databases/uniprot/uniprotkb_proteome_UP000005640_AND_revi_2025_02_19.fasta", sep = ""))
+save(uniprotHsIso, file = "output/data/uniprotHsIso.RData")
+save(uniprotHsIsoRevi, file = "output/data/uniprotHsIsoRevi.RData")
+# Checkpoint
+#load("output/data/uniprotHsIso.RData")
+#load("output/data/uniprotHsIsoRevi.RData")
+##Load yeast proteome
+sgdProteome <- read_fastaseq(paste(home_directory, 
+                                         "data/biol_databases/SGD/orf_trans_all.fasta", sep = "")) %>%
+  mutate(ORF = rownames(.),
+         sequence = gsub("*", "", sequence, fixed = T))
+
+
+#Function for fetching sequence windows from uniprot using position and identifer
+fetchSeqWindsUnip <- function(data, uniprotCol, positionCol){
+  data <- as.data.frame(data)
+  unipSeqWindVec <- c()
+  for (i in 1:nrow(data)){
+    unip <- data[i, uniprotCol]
+    pos <- data[i, positionCol]
+    unipSeq <- uniprotHsIso$sequence[which(uniprotHsIso$uniprotkb == unip)]
+    ##Return NA if position is too long
+    if (pos > str_length(unipSeq)){
+      unipSeqWind <- NA
+    } else {
+      unipSeq <- paste(c(rep("_", 7), unipSeq, rep("_", 7)), collapse = "")
+      unipSeqWind <- substr(unipSeq, start = pos, stop = pos + 14)
+    }
+    unipSeqWindVec[i] <- unipSeqWind
+  }
+  return(unipSeqWindVec)
+}
+```
+
+
+# Load in and prep data
+## Load in
+```{r}
+#Experimental data
+mutSscores <- read.csv("data/experiments/Scores_KO_pointMut.csv")
+sort(unique(mutSscores$anot))
+##Extract mutation and type
+mutSscores$mutation <- strsplit(mutSscores$anot, "_") %>% map(~.[2]) %>% unlist
+mutSscores$mutType <- "Site"
+mutSscores$mutType[which(mutSscores$mutation %in% c("DAMP", "KO"))] <- "Gene"
+mutSscores$mutType[which(mutSscores$mutation %in% c("WT"))] <- "WT"
+##Make nicer names
+mutSscores$anotNice <- gsub("_", " ", mutSscores$anot) %>% gsub("DAMP", "KD", .)
+mutSscores$anotNiceNoGene <- gsub("^.+ ", "", mutSscores$anotNice)
+
+# Map between yeast and human sites
+mutSiteMapProc <- read_csv("data/experiments/mutSiteMapProc__2.csv")
+mutSscores <- subset(mutSscores, gen_name %in% c(mutSiteMapProc$geneMapped, "BY4741", "DHY214"))
+```
+
+# Prepare s-score data and export
+## Prepare data
+```{r}
+#Order levels
+mutSscores <- mutSscores %>%
+  mutate(time = factor(time, levels = sort(unique(time), decreasing = T)),
+         treatment = factor(treatment, levels = sort(unique(treatment), decreasing = T))) %>%
+  .[order(.$treatment, .$time), ] %>%
+  mutate(condition = factor(condition, levels = unique(condition)))
+
+#Add replicate identifier
+mutSscores <- mutSscores %>%
+  .[order(.$strain), ] %>%
+  group_by(anot) %>%
+  mutate(replicateID = paste0(anot, "_", dense_rank(strain)))
+```
+
+
+## Export metadata for supps 
+### Conditions 
+```{r}
+# Get conditions
+condMeta <- data.frame("condition" = unique(datOneMut$condition)) %>%  
+  mutate(time = gsub("-.+$", "", condition),
+         treatment = gsub("^.+-", "", condition))
+```
+
+
+Using Bede's methods 
+```{r}
+# Load Bede's conditions
+BedeMeta <- map(c("Sheet1", "Special"), function(sheet){
+  read_xlsx(path = "data/experiments/yeastMethodsBede/conditions for screen.xlsx", sheet = sheet)
+})
+commonNames <- map(BedeMeta, colnames) %>% purrr::reduce(intersect)
+BedeMeta <- map_dfr(BedeMeta, function(x){x[, commonNames]}, .id = "source") %>% 
+  subset(!is.na(Abbreviation)) %>%  
+  .[, c("abbrev_corrected", "condition", "carrier", "concentration")] %>% 
+  distinct %>%  
+  dplyr::rename("conditionDescription" = "condition", 
+                "treatment" = "abbrev_corrected") %>%  
+  mutate(treatment = toupper(gsub("48H-", "", treatment)))
+
+# Map into metadata
+condMeta <- left_join(condMeta, BedeMeta[, c("treatment", setdiff(colnames(BedeMeta), colnames(condMeta)))], by = "treatment") 
+View(condMeta)
+
+# Export into excel for supp info
+## Prep
+renameCols <- c(
+  "condition" = 'Condition',
+  "time" = "Timepoint (hours)",
+  "treatment" = "Treatment",
+  "conditionDescription" = "Condition description",
+  "carrier" = "Carrier",
+  "concentration" = "Concentration"
+)
+condMetaExp <- condMeta[, names(renameCols)] %>% 
+  dplyr::rename(!!!setNames(names(renameCols), renameCols))
+## Write
+outDir = "output/data/experiments/SuppTable_yeastExps.xlsx"
+sheet = "conditionDescriptions"
+if (file.exists(outDir)){
+  wb <- loadWorkbook(outDir)
+} else {
+  wb <- createWorkbook(outDir)
+}
+removeWorksheet(wb, sheet)
+addWorksheet(wb, sheet)
+writeData(wb, sheet = sheet, x = condMetaExp)
+saveWorkbook(wb, outDir, overwrite = TRUE)
+```
+
+
+### Strain info  
+```{r}
+# Set up metadata
+strainMeta <- mutSscores[, c("strain", "anot", "ID")] %>% distinct %>%  
+  mutate(strainID = gsub("_.+$", "", strain),
+         replicateID = strain %>% gsub("^.+_", "", .) %>% gsub("-.+$", "", .))
+
+# Inspect strainIDs
+strainIDMeta <- strainMeta[, c("anot", "strainID")] %>% distinct 
+
+# Make metadata for individual mutants
+mutMeta <- strainMeta %>% dplyr::select("anot") %>% distinct %>% 
+  dplyr::rename("yeastMutant" = "anot")
+
+# Map in human sites
+matchDat <- mutSiteMapProc %>% subset(windows_match == "Y") %>% 
+  dplyr::select("humanSite", "yeastMutant", "hasFuncScore")
+mutMeta <- left_join(mutMeta, matchDat, by = "yeastMutant")
+
+# Map in func score
+mutMeta <- left_join(mutMeta, ubiFeatPreds[, c("uniprot_site", "functional_score")] %>%  
+  dplyr::rename("humanSite" = "uniprot_site"), 
+                    by = "humanSite")
+
+# Export
+## Prep
+renameCols <- c(
+  "yeastMutant" = 'Gene/strain + mutation',
+  "humanSite" = "Human ubi-site",
+  "functional_score" = "Functional score (human ubi-site)"
+)
+mutMetaExp <- mutMeta[, names(renameCols)] %>% 
+  dplyr::rename(!!!setNames(names(renameCols), renameCols))
+## Write
+outDir = "output/data/experiments/SuppTable_yeastExps.xlsx"
+sheet = "mutantDescriptions"
+if (file.exists(outDir)){
+  wb <- loadWorkbook(outDir)
+} else {
+  wb <- createWorkbook(outDir)
+}
+removeWorksheet(wb, sheet)
+addWorksheet(wb, sheet)
+writeData(wb, sheet = sheet, x = mutMetaExp)
+saveWorkbook(wb, outDir, overwrite = TRUE)
+```
+
+### Primers and donor DNA
+```{r}
+primerDonorF <- "data/experiments/yeastMethodsBede/Final Guides to order_with_mod.xlsx"
+
+# Primers
+primerDat <- read_xlsx(path = primerDonorF, sheet = "Guides") %>%  
+  as.data.frame %>%  
+  subset(!is.na(Name)) %>% 
+  dplyr::rename("sequence" = "5>3") %>%  
+  mutate(Name = gsub("\\s+_", "_", Name)) %>%
+  mutate(gene = strsplit(Name, "_") %>% map(~.[1]) %>% unlist,
+          pos = strsplit(Name, "_") %>% map(~.[2]) %>% unlist) %>%  
+  separate_rows("pos", sep = ",") %>%  
+  mutate(gene_pos = paste(gene, pos, sep = "_"))
+## Check if all mutations are present
+muts_gene_pos <- mutMeta$yeastMutant %>% .[grep("_K\\d+R$", .)] %>% gsub("_K", "_", .) %>% gsub("R$", "", .)
+setdiff(muts_gene_pos, primerDat$gene_pos)
+## Subset for final mutations
+primerDatSub <- subset(primerDat, gene_pos %in% muts_gene_pos) %>%  
+  .[, c("Name", "sequence")] %>% distinct %>%  
+  .[order(.$Name), ]
+## Export
+## Prep
+renameCols <- c(
+  "Name" = 'Target',
+  "sequence" = "Sequence"
+)
+primerDatSubExp <- primerDatSub[, names(renameCols)] %>% 
+  dplyr::rename(!!!setNames(names(renameCols), renameCols))
+## Write
+outDir = "output/data/experiments/SuppTable_yeastExps.xlsx"
+sheet = "primers"
+if (file.exists(outDir)){
+  wb <- loadWorkbook(outDir)
+} else {
+  wb <- createWorkbook(outDir)
+}
+removeWorksheet(wb, sheet)
+addWorksheet(wb, sheet)
+writeData(wb, sheet = sheet, x = primerDatSubExp)
+saveWorkbook(wb, outDir, overwrite = TRUE)
+
+# Donor DNA
+donorDat <- read_xlsx(path = primerDonorF, sheet = "Donors") %>%  
+  as.data.frame %>%  
+  subset(!is.na(Name)) %>%  
+  subset(grepl("/", Name) == F) %>%  
+  mutate(Name = gsub("\\s+_", "_", Name)) %>%
+  mutate(gene = strsplit(Name, "_") %>% map(~.[1]) %>% unlist,
+          pos = strsplit(Name, "_") %>% map(~.[2]) %>% unlist) %>%   
+  mutate(gene_pos = paste(gene, pos, sep = "_"))
+setdiff(muts_gene_pos, donorDat$gene_pos)
+## Subset for final mutations
+View(donorDat)
+donorDatSub <- subset(donorDat, gene_pos %in% muts_gene_pos) %>%  
+  .[, c("Name", "Sequence")] %>% distinct %>%  
+  .[order(.$Name), ]
+## Export
+## Prep
+renameCols <- c(
+  "Name" = 'Target',
+  "Sequence" = "Sequence"
+)
+donorDatSubExp <- donorDatSub[, names(renameCols)] %>% 
+  dplyr::rename(!!!setNames(names(renameCols), renameCols))
+## Write
+outDir = "output/data/experiments/SuppTable_yeastExps.xlsx"
+sheet = "donors"
+if (file.exists(outDir)){
+  wb <- loadWorkbook(outDir)
+} else {
+  wb <- createWorkbook(outDir)
+}
+removeWorksheet(wb, sheet)
+addWorksheet(wb, sheet)
+writeData(wb, sheet = sheet, x = donorDatSubExp)
+saveWorkbook(wb, outDir, overwrite = TRUE)
+```
+
+### S-scores 
+```{r}
+# Map in  metadata
+mutSscores_wMeta <- mutSscores %>% 
+  ungroup %>% 
+  dplyr::select(c("score", "qvalue", "condition", "strain")) %>%  
+  as.data.frame
+metaCols <- c("anot", "strainID", "replicateID")
+mutSscores_wMeta$strain <- factor(mutSscores_wMeta$strain, 
+  levels = strainMeta$strain)
+strainMeta <- as.data.frame(strainMeta)
+for (col in metaCols){
+  mutSscores_wMeta[, col] <- mutSscores_wMeta$strain 
+  levels(mutSscores_wMeta[, col]) <- strainMeta[, col]
+  mutSscores_wMeta[, col] <- as.character(mutSscores_wMeta[, col])
+}
+
+# Export
+renameCols <- c(
+  "anot" = 'Gene/strain + mutation',
+  "strainID" = "Strain ID",
+  "replicateID" = "Replicate",
+  "score" = "S-score",
+  "qvalue" = "Q-value"
+)
+mutSscores_wMetaExp <- mutSscores_wMeta[, names(renameCols)] %>% 
+  dplyr::rename(!!!setNames(names(renameCols), renameCols))
+## Write
+outDir = "output/data/experiments/SuppTable_yeastExps.xlsx"
+sheet = "sscores"
+if (file.exists(outDir)){
+  wb <- loadWorkbook(outDir)
+} else {
+  wb <- createWorkbook(outDir)
+}
+removeWorksheet(wb, sheet)
+addWorksheet(wb, sheet)
+writeData(wb, sheet = sheet, x = mutSscores_wMetaExp)
+saveWorkbook(wb, outDir, overwrite = TRUE)
+```
+
+
+
+# Collapse replica and timepoints, and plot results
+```{r}
+colsToKeep <- colnames(mutSscores)[-which(colnames(mutSscores) %in% c("treatment", "anot", "score", "qvalue"))]
+mutSscores_coll <- mutSscores %>% 
+  group_by(treatment, anot) %>%  
+  summarise(score = mean(score),
+            qvalue = geoMean(qvalue),
+            across(all_of(colsToKeep), ~unique(.)[1]),
+            .groups = "drop")
+```
+
+
+## Filter for significance 
+```{r}
+mutSscores_coll$sig <- mutSscores_coll$qvalue < 0.01
+
+#Significance per mutant
+mutSscores_collSumm <- mutSscores_coll %>% group_by(anot) %>% 
+  summarise(numPhen = sum(sig), gen_name = unique(gen_name), mutType = unique(mutType)) %>% 
+  .[order(.$numPhen, decreasing = T), ]
+
+split(mutSscores_collSumm, mutSscores_collSumm$mutType)
+table(mutSscores_collSumm$mutType)
+```
+
+## Plot heatmaps for site mutants with phenotypes
+```{r}
+SitesWithPhenos <- subset(mutSscores_collSumm, mutType == "Site" & numPhen > 0)$anot 
+
+plotParams <- list(
+  "YPT1_K122R" = list(width = 2, height = 2),
+  "PGI1_K371R" = list(width = 1.75, height = 2),
+  "TUB2_K58R" = list(width = 1.75, height = 2)
+)
+
+mutSscores_coll <- as.data.frame(mutSscores_coll)
+for (i in 1:length(plotParams)){
+  site <- names(plotParams)[i]
+  params <- plotParams[[i]]
+  gene <- subset(mutSscores_coll, anot == site)$gen_name %>% unique
+  sscoreDatSub <- subset(mutSscores_coll, gen_name == gene)
+  ## Get conditions significant in any site mutant for this gene
+  sigConds <- subset(sscoreDatSub, sig == T)$treatment %>% unique #Use all significant for this gene
+  sscoreDatSub <- subset(sscoreDatSub, treatment %in% sigConds)
+  ## Sort data
+  sortedTreats <- sscoreDatSub %>% 
+    filter(anot == site) %>% 
+    arrange(score) %>% 
+    distinct(treatment) %>% 
+    pull(treatment)
+  sscoreDatSub$treatment <- factor(sscoreDatSub$treatment, levels = sortedTreats)
+  ## Plot
+  hmap_sscores(sscoreDat = sscoreDatSub, xaxis = "anotNiceNoGene", yaxis = "treatment") + 
+              theme(axis.title.x = element_blank(), axis.title.y = element_blank()) +
+              ggtitle(gene)
+  ggsave_pdfpng(file = paste0("output/images/experiments/hmaps/hmap_sscore_", site), 
+                width = params$width, height = params$height)
+}
+```
+
+
+# Overview of scores and number of phenotypes 
+```{r}
+# Map in functional score
+humanYeastSumm <- left_join(mutSiteMapProc, ubiFeatPreds[, c("uniprot_site", "functional_score")] %>% 
+                                            dplyr::rename("humanSite" = "uniprot_site"), by = "humanSite")
+# Map in number of phenotypes
+humanYeastSumm <- left_join(humanYeastSumm, mutSscores_collSumm[, c("anot", "numPhen")] %>% 
+                                            dplyr::rename("yeastMutant" = "anot"))
+humanYeastSumm <- humanYeastSumm %>% mutate(humanAApos = gsub("^.+_", "", humanSite)) %>% 
+                                     mutate(humanGeneSite = paste(Gene, humanAApos, sep = " "),   
+                                            yeastGeneSite = gsub("_", " ", yeastMutant)) %>% 
+                                     mutate(yeastGeneSite = gsub("R$", "", yeastGeneSite))
+```
+
+```{r}
+# Plot
+# Create the barplot. Bars for functional_score (red) and numPhen (blue) will be side‐by‐side.
+plotDat <- humanYeastSumm %>% 
+  .[order(.$functional_score, decreasing= T), ] %>%
+  mutate(row = row_number()) %>% 
+  pivot_longer(cols = c("functional_score", "numPhen"), names_to = "col", values_to = "val")   %>% 
+  mutate(humanYeastSite = paste(yeastGeneSite, " (", humanGeneSite, ")", sep = "")) %>%   
+  subset(col == "functional_score")
+## Plot  
+ggplot(plotDat, aes(x = row, y = val, fill = col)) +
+  geom_col(width = 0.8, position = position_dodge2(), 
+            fill = "#b3d1e0", colour = "#2373b6", linewidth = 0.235) +
+  scale_x_continuous(
+    name = "humanGeneSite",
+    breaks = plotDat$row,
+    labels = plotDat$humanGeneSite,
+    sec.axis = sec_axis(~., 
+                        name = "yeastGeneSite", 
+                        breaks = plotDat$row, 
+                        labels = plotDat$yeastGeneSite)
+  ) +
+  comfy_theme(rotate_x_text = T, x_text_angle = 90) +
+  theme(panel.background = element_rect(colour = "black", fill = NA, linewidth = 0.235),
+        axis.text.x.top = element_text(size = 7, colour = "black", angle = 90, vjust = 0.5, hjust = 0)) +
+  labs(y = "Ubi-site functional score")
+ggsave_pdfpng(file = "output/images/experiments/bplot_expSites_wScores",
+              width = 2.25, height = 2.5)
+
+# Just one axis  
+plotDat %>%
+  mutate(humanYeastSite = factor(humanYeastSite, levels = unique(humanYeastSite[order(val)]))) %>%
+  ggplot(aes(y = humanYeastSite, x = val)) +
+    geom_col(width = 0.75, position = position_dodge2(), 
+             fill = "#b3d1e0", colour = "#2373b6", linewidth = 0.235) +
+    scale_x_continuous(breaks = c(0, 0.5, 1.0)) +
+    comfy_theme() +
+    labs(x = "Ubi-site functional score", y = "Yeast ubi-site (human ubi-site)")
+ggsave_pdfpng(file = "output/images/experiments/bplot_expSites_wScores_oneYaxis",
+              width = 2.5, height = 2.4)
+
+```

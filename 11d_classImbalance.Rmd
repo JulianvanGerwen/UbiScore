@@ -1,0 +1,239 @@
+# Background
+Here I perform analysis comparing models trained under different class balance regimes, 
+to address the class imbalance in our data
+
+
+# Initialise
+```{r}
+library(tidyverse)
+library(purrr)
+library(ggplot2)
+library(ggridges)
+library(readxl)
+library(openxlsx)
+library(data.table)
+library(caret)
+
+home_directory <- ""
+source(paste0(home_directory, "scripts/essential_visualisations_JvG.R"))
+source(paste0(home_directory, "scripts/enrichment_analysis_JvG.R"))
+source(paste0(home_directory, "scripts/caret_JvG.R"))
+source("scripts/01_general.R")
+source("scripts/00_objects.R")
+source("scripts/03_visualisations.R")
+source("scripts/04_ubnOmics.R")
+source("scripts/02_model_training.R")
+source("scripts/16_model_accuracy.R") # Auxiliary functions for assessing accuracy
+```
+
+## Functions
+```{r}
+# Function: Plotting correlation matrix as heatmap
+hmap_corm <- function(corM, fillLims = c(0.8, 1), fontSize = 4){
+  # Convert correlation matrix to data frame and pivot longer
+  corM_long <- as.data.frame(corM) %>%
+    rownames_to_column(var = "row") %>%
+    pivot_longer(
+      cols = -row,
+      names_to = "column",
+      values_to = "correlation"
+    ) %>%
+    mutate(
+      row = factor(row, levels = rownames(corM)),
+      column = factor(column, levels = colnames(corM))
+    )
+
+  # Plot with ggplot
+  plt <- ggplot(corM_long, aes(x = column, y = row, fill = correlation)) +
+    geom_tile() +
+    scale_fill_gradientn(colours = rev(brewer.pal(9, "RdBu")), limits = fillLims) +
+    comfy_theme(rotate_x_text = T) + coord_fixed()  + 
+    theme(
+      axis.text.y = element_text(colour = "black", hjust = 1, size = fontSize),
+      axis.text.x = element_text(colour = "black", hjust = 1, size = fontSize, angle = 90))
+  return(plt)
+}
+
+```
+
+# Compare different subsampling procedures (retrain1Csubsamps)
+These models are trainined in 11c_extra_model_training.Rmd
+## Load results
+```{r}
+# Get model names in the right order
+resDir <- "output/data/functional_scores/retrain1Csubsamps/"
+mods <- dir(resDir) %>% .[grep("modsPredsTest_df_", .)] %>% gsub("modsPredsTest_df_", "", .) %>% gsub(".RData", "", ., fixed = T)
+modsDf <- data.frame("mods" = mods) %>% mutate(x = as.numeric(gsub("x.+", "", mods)))
+modsDf$x[which(is.na(modsDf$x))] <- 100000
+modsDf <- modsDf[order(modsDf$x, decreasing = F), ]
+mods <- modsDf$mods
+# Load data
+testSetPreds_lst <- list()
+allPreds_lst <- list()
+for (modelName in mods){
+  load(paste0(resDir, "modsPredsTest_df_", modelName, ".RData"))
+  testSetPreds_lst[[modelName]] <- modsPredsTest_df
+  load(file = paste0(resDir, "allPredsLst_", modelName, ".RData"))
+  allPredsDf <- map_dfr(allPredsLst, function(x){x}, .id = "Resample")
+  allPreds_lst[[modelName]] <- allPredsDf
+}
+
+# Load model trained on all data
+load(paste0(resDir, "allPredsDf_allDat.RData"))
+allPredsDf_allDat <- allPredsDf
+```
+
+
+## Compare AUC
+```{r}
+AUCdf <- map_dfr(testSetPreds_lst, function(predsDf){
+    AUCs <- predsDf %>% split(.$Resample) %>% 
+        map(~ROCAUC_fromPredictor(data = ., obsCol = "obs", predCol = "X1")) %>% unlist
+    data.frame("Resample" = names(AUCs), "AUC" = AUCs)
+}, .id = "Regime")  %>% mutate(Regime = factor(Regime, levels = mods)) %>% .[order(.$Regime), ]
+AUCsumm <- AUCdf %>% group_by(Regime) %>% summarise(AUC_mean = mean(AUC), AUC_sd = sd(AUC)) %>% ungroup 
+
+# Plot
+ggplot(AUCsumm, aes(x = Regime, y = AUC_mean)) +
+            geom_bar(stat = "identity", width = 0.8, linewidth = 0.235, fill = "grey") +
+            geom_errorbar(aes(ymin = AUC_mean - AUC_sd, ymax = AUC_mean + AUC_sd), 
+                                        width = 0.2, color = "black", size = 0.235) +
+            comfy_theme(include_legend = F, rotate_x_text = T) + 
+            theme(axis.title.y = element_blank(), axis.text.y = element_text(colour = "black", size = 6, hjust = 1)) + 
+            ggtitle("Test-set AUC")
+ggsave_pdfpng(file = "output/images/functional_scores/classImbalance/bar_retrain1Csubsamps_AUC", width = 2, height = 2)
+```
+
+
+## Compare predictions
+```{r}
+# Combine all predictions
+allPreds_comb <- map_dfr(allPreds_lst, function(x){
+    if ("Resample" %in% colnames(x) == F){colnames(x)[which(colnames(x) == "fold")] <- "Resample"}
+    return(x)
+}, .id = "Regime") %>% 
+  mutate(Regime = factor(Regime, levels = mods)) %>% .[order(.$Regime), ]
+
+## Pivot to wider
+allPreds_combWide <- allPreds_comb %>% mutate(id = paste(Regime, Resample, sep = "__")) %>% 
+    dplyr::select(c("uniprot_site", "X1", "id")) %>% 
+    pivot_wider(names_from = "id", values_from = "X1", id_cols = "uniprot_site") %>% 
+    as.data.frame %>% column_to_rownames("uniprot_site") 
+
+# Spearman's correlation
+corM <- cor(allPreds_combWide, method = "spearman")
+# Statistics
+mean(corM)
+min(corM)
+max(corM)
+
+# Plot
+hmap_corm(corM, fillLims = c(0.65, 1), fontSize = 2) +
+  ggtitle("Correlating predictions between models")
+ggsave_pdfpng(file = "output/images/functional_scores/classImbalance/hmap_retrain1Csubsamps_scoreCorrs", width = 10, height = 10)
+```
+
+Take median of predictions across resamples and compare these
+```{r}
+# Take median of predictions
+allPreds_combMedians <- allPreds_comb %>% group_by(Regime, uniprot_site) %>% 
+    summarise(X1 = median(X1)) %>% ungroup
+allPreds_combMediansWide <- allPreds_combMedians %>% pivot_wider(names_from = "Regime", values_from = "X1") %>% 
+    as.data.frame %>% column_to_rownames("uniprot_site")
+corM_medians <- cor(allPreds_combMediansWide, method = "spearman")
+
+# Statistics
+mean(corM_medians)
+min(corM_medians)
+max(corM_medians)
+
+#Plot
+hmap_corm(corM_medians, fillLims = c(0.65, 1), fontSize = 4) +
+  ggtitle("Median prediction overall")
+ggsave_pdfpng(file = "output/images/functional_scores/classImbalance/hmap_retrain1Csubsamps_TotalMedianCorrs", width = 3, height = 3)
+
+# Correlate just two conditions
+ggplot(allPreds_combMediansWide, aes(x = `10x NoWeights`, y = `10x WWeights`)) + 
+  geom_point(shape = 16, size = 0.5, alpha = 0.3) + 
+  comfy_theme() + 
+  ggtitle("Median prediction across folds")
+ggsave_pdfpng(file = "output/images/functional_scores/classImbalance/pplot_retrain1Csubsamps_TotalMedianCorrs_10x", width = 2.5, height = 2.5)
+```
+
+Take median of predictions across resamples within each fold and compare these
+```{r}
+# Take median of predictions
+allPreds_comb <- allPreds_comb %>% mutate(Resample = factor(Resample)) %>% mutate(Fold = Resample)
+levels(allPreds_comb$Fold) <- gsub("__.+$", "", levels(allPreds_comb$Fold))
+allPreds_combMedians_Fold <- allPreds_comb %>% 
+group_by(Regime, uniprot_site, Fold) %>% 
+    summarise(X1 = median(X1)) %>% ungroup
+allPreds_combMedians_FoldWide <- allPreds_combMedians_Fold %>% 
+  .[order(.$Fold, .$Regime), ] %>% 
+  mutate(RegimeFold = paste(Regime, Fold, sep = "__")) %>% 
+  dplyr::select(c("RegimeFold", "X1", "uniprot_site")) %>%
+  pivot_wider(names_from = "RegimeFold", values_from = "X1") %>% 
+    as.data.frame %>% column_to_rownames("uniprot_site")
+corM_FoldMedians <- cor(allPreds_combMedians_FoldWide, method = "spearman")
+
+# Plot
+hmap_corm(corM_FoldMedians, fillLims = c(0.65, 1), fontSize = 4) +
+  ggtitle("Median of predictions within folds")
+ggsave_pdfpng(file = "output/images/functional_scores/classImbalance/hmap_retrain1Csubsamps_FoldMedianCorrs", width = 5, height = 5)
+```
+
+
+
+# Analysis of similarity of final models
+Here I look at the final models trainined in 11_training_models.Rmd
+
+## Load and prepare final predictions
+```{r}
+# Load
+suffix <- "attempt11_revisions"
+load(paste0("output/data/functional_scores/allPredsLstDf__", suffix, ".RData")) # Load predictions
+
+# Pivot to wider
+allPredsLstDf_Wide <- allPredsLstDf %>% mutate(id = fold) %>% 
+    dplyr::select(c("uniprot_site", "X1", "id")) %>% 
+    pivot_wider(names_from = "id", values_from = "X1", id_cols = "uniprot_site") %>% 
+    as.data.frame %>% column_to_rownames("uniprot_site") 
+# Get median across models
+allPredsLstDf_Wide$final_score <- apply(allPredsLstDf_Wide[, which(colnames(allPredsLstDf_Wide) %in% allPredsLstDf$fold)], 1, "median", na.rm = T)
+# Map in scores from a model trained on all data
+load(paste0(resDir, "allPredsDf_allDat.RData"))
+allPredsDf_allDat <- allPredsDf
+allPredsLstDf_Wide <- left_join(
+  rownames_to_column(allPredsLstDf_Wide, "uniprot_site"),
+  dplyr::rename(allPredsDf_allDat, "scoreAllData" = "X1"), 
+  by = "uniprot_site") %>%  
+  column_to_rownames("uniprot_site")
+```
+
+## Plot different comparisons
+```{r}
+##### Everything #####
+corM <- cor(allPredsLstDf_Wide, method = "spearman")
+# Statistics
+mean(corM)
+min(corM)
+max(corM)
+# Correlation between final predictions and each model
+mean(corM["final_score", grep("^Rep\\d", colnames(corM))])
+colnames(corM)
+# Plot
+hmap_corm(corM, fillLims = c(0.65, 1), fontSize = 4) +
+  ggtitle("Final predictions")
+ggsave_pdfpng(file = "output/images/functional_scores/classImbalance/hmap_finalScoresAll_scoreCorrs", width = 5, height = 5)
+
+##### Just 25 models #####
+corM <- cor(allPredsLstDf_Wide[, grep("^Rep\\d", colnames(allPredsLstDf_Wide))], method = "spearman")
+# Statistics
+mean(corM)
+min(corM)
+max(corM)
+# Plot
+hmap_corm(corM, fillLims = c(0.65, 1), fontSize = 4) +
+  ggtitle("Final predictions")
+ggsave_pdfpng(file = "output/images/functional_scores/classImbalance/hmap_finalScores25mods_scoreCorrs", width = 5, height = 5)
+```

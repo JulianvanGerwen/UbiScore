@@ -1,0 +1,825 @@
+# Background
+Here I process and explore the PRIDE human ubn build
+I also map our omics-derived ensp-based sites into the PRIDE build, and 
+I combine this with a mapping for the PRIDE build from uniprot to ENSP
+
+Note that all annotation of the PRIDE build with features and other information happens in 
+the script 04_featurePrep.Rmd
+
+# Initialise
+```{r}
+library(tidyverse)
+library(purrr)
+library(ggplot2)
+library(ggridges)
+library(DT)
+library(readxl)
+library(openxlsx)
+
+home_directory <- ""
+source(paste0(home_directory, "scripts/essential_visualisations_JvG.R"))
+source(paste0(home_directory, "scripts/enrichment_analysis_JvG.R"))
+source("scripts/00_objects.R")
+source("scripts/01_general.R")
+```
+
+Load in relevant proteomes
+```{r}
+##Function: read in a fasta file of protein sequences and convert them into a data frame
+library(seqinr)
+read_fastaseq <- function(directory){
+  seqs_raw <- read.fasta(directory)
+  seqs <- data.frame("sequence" = map(seqs_raw, ~paste(., collapse = "")) %>% unlist)
+  seqs$sequence <- toupper(seqs$sequence)
+  seqs$uniprotkb <- strsplit(rownames(seqs), "\\|") %>% map(~.[2]) %>% unlist
+  return(seqs)
+}
+##Load proteomes
+uniprotHsIso <- read_fastaseq(paste(home_directory, 
+                                         "data/biol_databases/uniprot/uniprotkb_proteome_UP000005640_2025_02_19.fasta", sep = ""))
+uniprotHsIsoRevi <- read_fastaseq(paste(home_directory, 
+                                         "data/biol_databases/uniprot/uniprotkb_proteome_UP000005640_AND_revi_2025_02_19.fasta", sep = ""))
+uniprotHsRevi <- subset(uniprotHsIsoRevi, !grepl("-", uniprotkb))
+```
+
+
+# Load and process relevant files
+```{r}
+processBuild <- function(data){
+  dataProc <- data %>%
+    mutate(uniprot = strsplit(Protein, "|", fixed = T) %>% map(~.[2]) %>% unlist,
+           unipGene = strsplit(Protein, "|", fixed = T) %>% map(~.[3]) %>% unlist) %>%
+    mutate(site = paste0(PTM_residue, Protein_pos)) %>%
+    mutate(uniprot_site = paste(uniprot, site, sep = "_"),
+           uniprot_pos = paste(uniprot, Protein_pos, sep = "_")) %>%
+    #Remove A decoys
+    subset(PTM_residue != "A") %>%
+    as.data.frame
+  return(dataProc)
+}
+#buildPos
+buildPos <- read_csv("data/PRIDE/DATE/G2S1B_0.05_protein_pos_single_prot_mapping.csv") %>% processBuild
+#buildPosAllprots
+buildPosAllprots <- read_csv("data/PRIDE/DATE/G2S1B_0.05_protein_pos_all_prot_mapping.csv") %>% processBuild
+```
+
+Explore
+```{r}
+nrow(buildPos)
+length(unique(paste(buildPos$Protein, buildPos$Protein_pos, sep = "")))
+table(buildPos$PTM_residue)
+
+#Are uniprots reviewed?
+uniqUnips <- list("buildPos" = buildPos, "buildPosAllprots" = buildPosAllprots) %>% 
+  map(~unique(.$uniprot))
+map(uniqUnips, length)
+map(uniqUnips, ~length(intersect(., uniprotHsIso$uniprotkb)))
+map(uniqUnips, ~length(intersect(., uniprotHsIsoRevi$uniprotkb)))
+```
+
+
+## Export for supps
+```{r}
+# Flag redundant mappings
+buildExp <- buildPosAllprots %>% 
+  mutate(redundantSite = uniprot_pos %in% buildPos$uniprot_pos == F) %>% 
+  .[order(.$redundantSite, decreasing = F), ]
+
+# Rename
+renameCols <- c(
+    "uniprot" = "Protein",
+    "unipGene" = "Gene Symbol",
+    "site" = "Ubi-site",
+    "PTM_FLR_category" = "Localisation confidence",
+    "Sum_of_PSM_counts(5%FLR)" = "Sum_of_PSM_counts(5%FLR)",
+    "redundantSite" = "Site excluded (redundant mapping)"
+)
+PRIDEcols <- colnames(buildExp) %>% .[grep("^PXD", .)]
+buildExp <- buildExp[, c(names(renameCols), PRIDEcols)] %>% 
+    dplyr::rename(!!setNames(names(renameCols), renameCols))
+outDir = "output/data/PRIDE/SuppTable_referenceUbnome.xlsx"
+sheet = "ubnome"
+if (file.exists(outDir)){
+  wb <- loadWorkbook(outDir)
+} else {
+  wb <- createWorkbook(outDir)
+}
+removeWorksheet(wb, sheet)
+addWorksheet(wb, sheet)
+writeData(wb, sheet = sheet, x = buildExp)
+saveWorkbook(wb, outDir, overwrite = TRUE)
+```
+
+
+
+# Identifier mapping
+
+## Map between the omics-derived ensp sites and the PRIDE build
+Here I map the sites in Inigo's data
+
+### Set up data
+Set up Inigo's sites
+```{r}
+#All sites, filtered for PRIDE
+inigoFiltered <- read_csv("data/features/Beltrao_sites_annotated_filtered.csv") %>%
+  mutate(uniprot = gsub("_\\d+$", "", uniprot_pos))
+
+#All sites before filtering
+inigoAll <- read_csv("data/features/ubnOmics/All human sites merged WITH AGE and Q.csv") %>%
+  dplyr::rename("uniprot" = "Entry")
+
+datLst <- list("inigoFiltered" = inigoFiltered, "inigoAll" = inigoAll)
+
+#Do the IDpos agree?
+IDpos <- datLst %>% map(~unique(.$IDpos))
+ggVennDiagram_nice(IDpos)
+
+#Do the uniprot identifiers agree?
+siteUnipLst <- map(datLst, ~distinct(.[, c("IDpos", "uniprot")]))
+colnames(siteUnipLst$inigoAll)[2] <- "uniprot_all"
+siteUnipDf <- left_join(siteUnipLst$inigoFiltered, siteUnipLst$inigoAll, by = "IDpos")
+siteUnipDf$unipSame <- siteUnipDf$uniprot == siteUnipDf$uniprot_all
+siteUnipDf %>% dplyr::select(-c("IDpos")) %>% distinct %>% .[, "unipSame"] %>% table
+
+
+#Inspect uniprot identifiers from inigoAll. Are they reviewed/present?
+inigoAllUnips <- unique(inigoAll$uniprot)
+length(inigoAllUnips)
+length(grep("-", inigoAllUnips))
+length(intersect(inigoAllUnips, uniprotHsIso$uniprotkb))
+length(intersect(inigoAllUnips, uniprotHsIsoRevi$uniprotkb))
+```
+
+
+### Map uniprot identifiers into the (reviewed) proteome
+```{r}
+#Set up uniprot identifier data
+inigoAll <- inigoAll %>%
+  mutate("inProteome" = uniprot %in% uniprotHsIso$uniprotkb,
+         "inProteomeRevi" = uniprot %in% uniprotHsIsoRevi$uniprotkb)
+inigoAllUnipdf <- inigoAll[, c("uniprot", "inProteome", "inProteomeRevi")] %>% distinct
+#Set up mapping
+library(UniProt.ws)
+up <- UniProt.ws()
+
+
+#Step 1: Map all identifiers not in the proteome
+notInProteomeMap <- mapUniProt(
+  from = "UniProtKB_AC-ID",
+  to = "UniParc",
+  query = subset(inigoAllUnipdf, inProteome == F & !is.na(uniprot))$uniprot
+)
+save(notInProteomeMap, file = "output/data/PRIDE/notInProteomeMap__1.RData")
+notInProteomeMap <- notInProteomeMap %>%  mutate(UniProtKB = gsub("\\.\\d+", "", UniProtKB))
+##Subset for those in proteome and/or reviewed
+notInProteomeMap$unipsSplit <- strsplit(notInProteomeMap$UniProtKB, "; ")
+notInProteomeMap$unipsSplitInproteome <- map(notInProteomeMap$unipsSplit, ~intersect(., uniprotHsIso$uniprotkb))
+notInProteomeMap$unipsSplitRevi <- map(notInProteomeMap$unipsSplit, ~intersect(., uniprotHsIsoRevi$uniprotkb))
+##How many hits?
+map(notInProteomeMap$unipsSplitInproteome, length) %>% unlist %>% table
+map(notInProteomeMap$unipsSplitRevi, length) %>% unlist %>% table
+##Select matches
+notInProteomeMap$finalUnip <- NA
+for (i in 1:nrow(notInProteomeMap)){
+  #Use reviewed of possible
+  if (length(notInProteomeMap$unipsSplitRevi[[i]]) > 0){
+    unips <- notInProteomeMap$unipsSplitRevi[[i]]
+  #Otherwise use present but unreviewed
+  } else if (length(notInProteomeMap$unipsSplitInproteome[[i]]) > 0){
+    unips <- notInProteomeMap$unipsSplitInproteome[[i]]
+  } else {
+  #Otherwise keep the original
+    notInProteomeMap$finalUnip[i] <- notInProteomeMap$From[i]
+  }
+  #If there are still multiple uniprots, take the first one in the PRIDE data
+  if (length(unips) > 1){
+    print(i)
+    print(unips)
+    print(intersect(unips, buildPos$uniprot))
+    unips <- intersect(unips, buildPos$uniprot)
+  }
+  notInProteomeMap$finalUnip[i] <- unips[1]
+}
+#Map back
+inigoAllUnipdf$uniprotNew <- inigoAllUnipdf$uniprot
+for (i in 1:nrow(notInProteomeMap)){
+  inigoAllUnipdf$uniprotNew[which(inigoAllUnipdf$uniprot == notInProteomeMap$From[i])] <- notInProteomeMap$finalUnip[i]
+}
+
+#Step 2: Map unreviewed using gene names
+#Get gene names for all reviewed uniprots
+uniprotHsIsoRevi_geneNames <- mapUniProt(
+  from = "UniProtKB_AC-ID",
+  to = "UniProtKB",
+  query = subset(uniprotHsIsoRevi, !grepl("-", uniprotkb))$uniprotkb
+)
+save(uniprotHsIsoRevi_geneNames, file = "output/data/PRIDE/uniprotHsIsoRevi_geneNames__1.RData")
+uniprotHsIsoRevi_geneNames$Gene.NamesLst <- strsplit(uniprotHsIsoRevi_geneNames$Gene.Names, " ")
+uniprotHsIsoRevi_geneNames$firstGene <- map(uniprotHsIsoRevi_geneNames$Gene.NamesLst, ~.[1]) %>% unlist
+#Get gene names for ubn unreviewed uniprots
+notReviMap <- mapUniProt(
+  from = "UniProtKB_AC-ID",
+  to = "UniProtKB",
+  query = setdiff(inigoAllUnipdf$uniprotNew, uniprotHsIsoRevi$uniprotkb) %>% .[which(!is.na(.))]
+)
+notReviMap$Gene.NamesLst <- strsplit(notReviMap$Gene.Names, " ")
+notReviMap$firstGene <- map(notReviMap$Gene.NamesLst, ~.[1]) %>% unlist
+
+#Overlap of all gene names
+length(which(notReviMap$Gene.Names %in% uniprotHsIsoRevi_geneNames$Gene.Names))
+
+#Subset reviewed proteome for gene names present in mapping
+allMappingGenes <- unique(unlist(notReviMap$Gene.NamesLst))
+uniprotHsIsoRevi_geneNames$inMapping <- map(uniprotHsIsoRevi_geneNames$Gene.NamesLst, ~length(intersect(., allMappingGenes)) > 0) %>% unlist
+uniprotHsIsoRevi_geneNamesSub <- subset(uniprotHsIsoRevi_geneNames, inMapping == T)
+
+#Multiple gene names are listed, so find matches based on when any single one lines up
+notReviMap$geneMatchInds <- map(notReviMap$Gene.NamesLst, function(genes){
+  return(which(uniprotHsIsoRevi_geneNamesSub$firstGene %in% genes))
+})
+notReviMap$geneMatchNum <- map(notReviMap$geneMatchInds, length) %>% unlist
+
+#Get matches based on this
+notReviMap$finalUnip <- NA
+for (i in 1:nrow(notReviMap)){
+  inds <- notReviMap$geneMatchInds[[i]]
+  if (length(inds) == 1){
+    notReviMap$finalUnip[i] <- uniprotHsIsoRevi_geneNamesSub$From[inds]
+  } else {
+    notReviMap$finalUnip[i] <- notReviMap$From[i]
+  }
+}
+
+#Map back
+for (i in 1:nrow(notReviMap)){
+  inigoAllUnipdf$uniprotNew[which(inigoAllUnipdf$uniprot == notReviMap$From[i])] <- notReviMap$finalUnip[i]
+}
+
+#Remove isoforms
+inigoAllUnipdf$uniprotNew_wIso <- inigoAllUnipdf$uniprotNew
+inigoAllUnipdf$uniprotNew <- gsub("-\\d+$", "", inigoAllUnipdf$uniprotNew)
+
+#Map into site data
+inigoAllMapped <- left_join(inigoAll, inigoAllUnipdf[, c("uniprot", "uniprotNew")], by = "uniprot")
+```
+
+
+### Map sequence windows into uniprots
+```{r}
+inigoAllMapped <- inigoAllMapped[order(inigoAllMapped$uniprotNew), ]
+unipsOffset <- c("", inigoAllMapped$uniprotNew[-nrow(inigoAllMapped)])
+inigoAllMapped$newUnip <- inigoAllMapped$uniprotNew != unipsOffset
+inigoAllMapped$uniprot_pos_matches <- NA
+unipSeq <- ""
+for (i in 1:nrow(inigoAllMapped)){
+  #Get objects
+  unip <- inigoAllMapped$uniprotNew[i]
+  seqWind <- inigoAllMapped$sequence_window[i]
+  #Only proceed if uniprot is in the proteome
+  if (!is.na(unip) & unip %in% uniprotHsIso$uniprotkb){
+    #Get uniprot sequence
+    if (inigoAllMapped$newUnip[i]){
+      unipSeq <- uniprotHsIso$sequence[which(uniprotHsIso$uniprotkb == unip)]
+      unipSeq <- paste(c(rep("_", 7), unipSeq, rep("_", 7)), collapse = "")
+    }
+    #Match sequence window in
+    matchesDf <- stringr::str_locate_all(unipSeq, seqWind)[[1]]
+    if (nrow(matchesDf) == 0){
+      matches <- NA
+    } else {
+      newPosns <- as.numeric(matchesDf[, 1])
+      matches <- map(newPosns, ~paste0(unip, "_", .)) %>% unlist
+      matches <- paste(matches, collapse = ";")
+    }
+    inigoAllMapped$uniprot_pos_matches[i] <- matches
+  }
+}
+
+#Inspect matches
+inigoAllMapped$uniprot_pos_matches_num <- strsplit(inigoAllMapped$uniprot_pos_matches, ";") %>% 
+  map(function(x){
+    if (is.na(x[1])){ return(0) } else { return(length(x))}
+  }) %>% unlist
+table(inigoAllMapped$uniprot_pos_matches_num)
+##Inspect those with 0 matches
+###Uniprot not in the proteome?
+inigoAllMapped$uniprotNotInProt <- inigoAllMapped$uniprotNew %in% uniprotHsIso$uniprotkb == F
+table(inigoAllMapped$uniprot_pos_matches_num, inigoAllMapped$uniprotNotInProt)
+###Changed uniprot?
+inigoAllMapped$uniprotChanged <- inigoAllMapped$uniprotNew != inigoAllMapped$uniprot
+inigoAllMapped$uniprotChanged[is.na(inigoAllMapped$uniprotChanged)] <- FALSE
+table(inigoAllMapped$uniprot_pos_matches_num, inigoAllMapped$uniprotChanged)
+
+##For those with multiple matches, take those in the PRIDE atlas
+buildPos$PTM_FLR_category <- factor(buildPos$PTM_FLR_category, levels = c("Gold", "Silver", "Bronze"))
+buildPos <- buildPos[order(buildPos$PTM_FLR_category), ] #Order so that we pick Gold when given a choice
+inigoAllMapped$uniprot_pos_matches_noMult <- inigoAllMapped$uniprot_pos_matches
+for (i in 1:nrow(inigoAllMapped)){
+  if (inigoAllMapped$uniprot_pos_matches_num[i] > 1){
+    uniprot_pos_vec <- strsplit(inigoAllMapped$uniprot_pos_matches[i], ";")[[1]]
+    uniprot_pos_vec_inPRIDE <- intersect(buildPos$uniprot_pos, uniprot_pos_vec)
+    #If no matches are in PRIDE, just take the first
+    if (length(uniprot_pos_vec_inPRIDE) == 0){
+      inigoAllMapped$uniprot_pos_matches_noMult[i] <- uniprot_pos_vec[1]
+    } else {
+      inigoAllMapped$uniprot_pos_matches_noMult[i] <- uniprot_pos_vec_inPRIDE[1] #Take the first if there are still multiple
+    }
+  }
+}
+inigoAllMapped$uniprot_pos_matches_noMult_num <- strsplit(inigoAllMapped$uniprot_pos_matches_noMult, ";") %>% 
+  map(function(x){
+    if (is.na(x[1])){ return(0) } else { return(length(x))}
+  }) %>% unlist
+table(inigoAllMapped$uniprot_pos_matches_noMult_num)
+```
+
+
+### Overlap with PRIDE after mapping
+```{r}
+#Refilter inigoFiltered using the  pride set
+inigoFilteredFilt <- subset(inigoFiltered, uniprot_pos %in% buildPos$uniprot_pos)
+inigoAllMappedFilt <- subset(inigoAllMapped, uniprot_pos_matches_noMult %in% buildPos$uniprot_pos)
+nrow(inigoFilteredFilt)
+nrow(inigoAllMappedFilt)
+
+#Map in PRIDE info
+inigoAllMappedFilt <- dplyr::rename(inigoAllMappedFilt, "uniprot_pos" = "uniprot_pos_matches_noMult")
+inigoAllMappedFilt <- left_join(inigoAllMappedFilt, 
+                                buildPos[, c("PTM_FLR_category", "Sum_of_PSM_counts(5%FLR)", "uniprot_pos")],
+                                by = "uniprot_pos") %>%
+                      dplyr::rename("PRIDE_set" = "PTM_FLR_category", "PSM_sum" = "Sum_of_PSM_counts(5%FLR)")
+
+#Overlap between inigoFiltered and inigoAll
+lst <- list("filtered" = inigoFilteredFilt, "all" = inigoAllMappedFilt)
+ggVennDiagram_nice(map(lst, ~.$IDpos))
+inigoFilteredFilt[which(inigoFilteredFilt$IDpos %in% inigoAllMappedFilt$IDpos == F), ]
+```
+
+
+### Prepare for downstream analysis
+```{r}
+#Rename
+InigoFeatMapped <- inigoAllMappedFilt %>%
+  dplyr::rename("uniprotOld" = "uniprot") %>%
+  dplyr::rename(
+    "uniprot" = "uniprotNew"
+  )
+#Select columns
+cols <- c("IDpos", "ENSP", "uniprot_pos", "sequence_window", "ensp_pos",
+           "PRIDE_set", "PSM_sum", "common_ancestor_tax", "age_mya",
+           "PSP.ubi", "PSP.act", "PSP.met", "abundance",
+           "Function..CC.", "Calcium.binding", "Nucleotide.binding", "Nucleotide.binding.INSIDE",
+           "FinalBox", "HotSpot.pfam", "HotSpot.name", "times.quantified",
+           "times.quantified.proteasome", "proteasome.smaller.Q3", "DNAdam.bigger.Q3")
+InigoFeatMapped <- InigoFeatMapped[, cols]
+save(InigoFeatMapped, file = "output/data/InigoFeatMapped__3.RData")
+```
+
+
+### Make a map of identifiers for all human sites
+```{r}
+ubnOmicsSites_unipMap_hs <- inigoAllMapped %>% 
+  dplyr::rename("uniprot_old" = "uniprot") %>%
+  dplyr::rename("uniprot" = "uniprotNew",
+                "uniprot_pos" = "uniprot_pos_matches_noMult") %>%
+  dplyr::select(c("IDpos", "ENSP", "uniprot", "uniprot_pos", "sequence_window"))
+save(ubnOmicsSites_unipMap_hs, file = "output/data/ubnOmicsSites_unipMap_hs__3.RData")
+```
+
+
+## Map between the PRIDE uniprot sites and ENSP identifiers
+Here I combine the map derived above with another map from Inigo, to 
+map (almost) all sites in the PRIDE build to ENSP. This is necessary 
+for the conservation analysis
+```{r}
+# Load and set up data
+buildPos_wMap <- buildPos  # use the non-redundant database
+# Load site-uniprot map
+enspUnipMap <- read_delim("data/conservation/final_mapping_uniprot_ensembl.tab") %>% 
+    dplyr::rename(
+        "uniprot" = "Uniprot_protein",
+        "pos_fUniprot" = "Uniprot_position",
+        "sequence_window" = "seq_window",
+        "ensp" = "Ensembl_protein",
+        "pos_fEnsp" = "Ensembl_position") %>% 
+    mutate(uniprot_pos = paste(uniprot, pos_fUniprot, sep = "_"),
+        ensp_pos = paste(ensp, pos_fEnsp, sep = "_")) %>% 
+    mutate(ensp_pos = ifelse(is.na(pos_fEnsp), NA, ensp_pos))
+
+# Add Inigo's new map
+collapser <- function(x){ 
+        if (is.na(x)[1]){
+            return(NA)
+        } else {
+            return(paste(x, collapse = ";"))
+        }
+    }
+enspUnipMap_proc <- enspUnipMap[, c("uniprot_pos", "ensp_pos")] %>% 
+    group_by(uniprot_pos) %>% 
+    summarise(ensp_pos = collapser(ensp_pos), .groups = "drop") %>%  #Collapse unambiguous mapping
+    dplyr::rename("ensp_pos_InigoNew" = "ensp_pos")
+buildPos_wMap <- left_join(buildPos_wMap, enspUnipMap_proc, by = "uniprot_pos")
+
+# Add my ensp->uniprot map for the original sites
+InigoFeatMapped_proc <- InigoFeatMapped[, c("ensp_pos", "uniprot_pos")] %>% 
+    dplyr::rename("ensp_pos_MeOld" = "ensp_pos")
+buildPos_wMap <- left_join(buildPos_wMap, InigoFeatMapped_proc, by = "uniprot_pos")
+
+
+## Overview of mapping
+# How many sites get mapped
+table("ensp_pos_InigoNew" = !is.na(buildPos_wMap$ensp_pos_InigoNew), 
+    "ensp_pos_MeOld" = !is.na(buildPos_wMap$ensp_pos_MeOld))
+
+# Compare the two mappings
+buildPos_wMap$map_agrees <- buildPos_wMap$ensp_pos_InigoNew == buildPos_wMap$ensp_pos_MeOld
+## Inspect those that disagree
+subset(buildPos_wMap, map_agrees == F) %>% View
+
+## Assign mapping
+# Use my mappings, and when they are missing use Inigo's
+buildPos_wMap$ensp_pos_final <- ifelse(
+    is.na(buildPos_wMap$ensp_pos_MeOld),
+    buildPos_wMap$ensp_pos_InigoNew,
+    buildPos_wMap$ensp_pos_MeOld
+)
+
+## Export
+PRIDE_uniprotToEnsp <- buildPos_wMap[, c("uniprot_pos", "ensp_pos_final")] %>% 
+  dplyr::rename("ensp_pos" = "ensp_pos_final")
+save(PRIDE_uniprotToEnsp, file = "output/data/PRIDE_uniprotToEnsp__3.RData")
+```
+
+
+
+
+
+# Overview and broad characterisation of ubi sites in the build
+```{r}
+#Define build data to use. For now I use the build without subsetting for Inigo's data
+buildDat <- buildPos %>%
+  mutate(PTM_FLR_category = factor(PTM_FLR_category, levels = c("Gold", "Silver", "Bronze")))
+```
+
+## Number of sites and proteins
+```{r}
+#Number of sites
+numSummSites <- buildDat %>% group_by(PTM_FLR_category) %>%
+      summarise(num = length(unique(uniprot_site)),
+                group = "Sites")
+#Number of proteins. When a protein has sites of different quality, I pick the best
+bestLevel <- function(x){sort(x, decreasing = F)[1]}
+numSummProt <- buildDat[, c("PTM_FLR_category", "uniprot")] %>% 
+      group_by(uniprot) %>% summarise(PTM_FLR_category = bestLevel(PTM_FLR_category), .groups = "drop") %>%
+      group_by(PTM_FLR_category) %>% summarise(num = length(unique(uniprot)), group = "Proteins") 
+#Combine
+numSumm <- rbind(numSummSites, numSummProt) %>%
+      mutate(group = factor(group, levels = c("Sites", "Proteins")))
+
+#Plot
+ggplot(numSumm, aes(x = group, y = num, fill = PTM_FLR_category)) +
+  geom_col(position = "stack", width = 0.8) +
+  geom_text(data = numSumm %>% group_by(group) %>% 
+            summarise(total = sum(num), totalLab = scales::comma(sum(num))),
+            aes(x = group, y = total, label = totalLab),
+            vjust = -0.5, size = 1.875*7/5,
+            inherit.aes = F) +
+  comfy_theme(include_xaxis = F, rotate_x_text = T) +
+  theme(axis.title.x = element_blank()) +
+  labs(y = "# ubiquitination events") +
+  lims(y = c(0, 120000)) +
+  scale_fill_manual(values = prideSetColours, name = "Confidence")
+ggsave_pdfpng(file = "output/images/overview/PRIDE/bplot_numSitesProts",
+      width = 2.25, height = 2)
+```
+
+## Number of sites per protein
+```{r}
+numSitesPerprot <- buildDat %>% group_by(uniprot) %>% summarise(numSites = n()) %>%
+                    mutate(group = "all")
+#Summarise with bins
+numSitesPerprotSumm <- binAndSummarise(data = numSitesPerprot, bin_breaks = c(1, 2, 3, 4, 5, 6, 11, 51, Inf),
+                            groupCol = "group", valCol = "numSites",
+                            breakType = "integer") %>%
+              mutate(BinLab = Bin)
+levels(numSitesPerprotSumm$BinLab) <- map(levels(numSitesPerprotSumm$BinLab), function(x){
+  xSplit <- strsplit(x, "-")[[1]]
+  if (length(xSplit) > 1){
+    if (xSplit[1] == xSplit[2]){
+      x <- xSplit[1]
+    }
+  }
+  return(x)
+}) %>% unlist
+##Plot
+n <- length(levels(numSitesPerprotSumm$Bin))
+palette <- brewer.pal(9, "Blues")[(9 - n):9]
+ggplot(numSitesPerprotSumm, aes(x = BinLab, 
+                                fill = BinLab,
+                                y = n)) +
+      #geom_col(fill = prideSetColours["Gold"]) +
+      geom_col(colour = "#3a3a3a", linewidth = 0.235/2,
+      width = 0.85) +
+      comfy_theme(include_xaxis = F, include_legend = F) +
+      scale_fill_manual(values = palette) +
+      labs(x = "# ubi-sites per protein", y = "# proteins")
+ggsave_pdfpng(file = "output/images/overview/PRIDE/bplot_numSitesPerProt",
+      width = 2.65, height = 2)
+```
+
+
+
+## Protein abundance
+Set up protein abundance data
+```{r}
+#Map in paxDB data
+load(paste0(home_directory, "data/biol_databases/PaxDB/20250320/9606/9606-WHOLE_ORGANISM-integrated_mappedFID.RData"))
+
+#Get uniprot id
+uniprotHsIso$unip_id <- strsplit(rownames(uniprotHsIso), "|", fixed = T) %>% map(~.[3]) %>% unlist 
+buildDat <- left_join(buildDat, uniprotHsIso[, c("uniprotkb", "unip_id")] %>% dplyr::rename("uniprot" = "uniprotkb"))
+
+#Map abundance based on this
+buildDat <- left_join(buildDat, paxDBunipid[, c("abundance", "unip_id")])
+
+#How many get abundance?
+table(!is.na(buildDat$abundance))
+buildDat[, c("uniprot", "abundance")] %>% distinct %>% .[, "abundance"] %>% is.na %>% table
+```
+
+
+Explore protein abundance for ubn
+```{r}
+#Ubiquitinated proteins vs all proteins
+paxDBunipid$hasUbi <- paxDBunipid$unip_id %in% buildDat$unip_id 
+protAbundAll <- paxDBunipid %>%  
+      mutate(group = ifelse(hasUbi, "ubi", "all"))
+View(protAbundAll)
+##Plot
+
+###Histogram
+ggplot(protAbundAll, aes(x = abundance, fill = group)) +
+      geom_histogram(colour = "#3a3a3a", linewidth = 0.235/2) +
+      comfy_theme() +
+      scale_x_log10() +
+      scale_fill_manual(values =  setNames(c(PSPcolours["notReg"], "#2172b6"), c("all", "ubi")),
+                        labels = c("All", "Ubiquitinated"),
+                        name = "Proteins") + 
+      labs(x = "Protein abundance (ppm)", y = "# proteins")
+ggsave_pdfpng(file = "output/images/overview/PRIDE/hist_abund_ubiVsAll",
+          width = 2.75, height = 1.5)
+###Ridges
+ggplot(protAbundAll, aes(x = abundance, y = group, fill = group)) +
+      geom_density_ridges(linewidth = 0.235) +
+      comfy_theme() +
+      scale_x_log10() +
+      scale_fill_manual(values =  setNames(c(prideSetColours["Gold"], PSPcolours["notReg"]), c("ubi", "all"))) +
+      labs(x = "Protein abundance (ppm)")
+ggsave_pdfpng(file = "output/images/overview/PRIDE/ridge_abund_ubiVsAll",
+          width = 2.25, height = 1.5)
+
+#Different confidence scores
+ggplot(buildDat, aes(x = abundance, y = PTM_FLR_category, fill = PTM_FLR_category)) +
+      geom_density_ridges(linewidth = 0.235) +
+      comfy_theme() +
+      scale_x_log10(limits = c(1e-03, NA)) +
+      scale_fill_manual(values = prideSetColours, name = "Confidence") +
+      labs(x = "Protein abundance", y = "Confidence") 
+ggsave_pdfpng(file = "output/images/overview/PRIDE/ridge_abund_confidence",
+          width = 2.5, height = 1.5)
+## Hist
+ggplot(buildDat, aes(x = abundance, fill = factor(PTM_FLR_category, levels = rev(levels(PTM_FLR_category))))) +
+  geom_histogram(colour = "#3a3a3a", linewidth = 0.235/2) +
+  comfy_theme() +
+  scale_x_log10(limits = c(1e-03, NA)) +
+  scale_fill_manual(values =  prideSetColours,
+        labels = c("≥ Bronze", "≥ Silver", "Gold"),
+        name = "Confidence") + 
+  labs(x = "Protein abundance (ppm)", y = "# ubisites")
+ggsave_pdfpng(file = "output/images/overview/PRIDE/hist_abund_confidence",
+          width = 2.75, height = 1.5)
+```
+
+
+### Number of sites vs other features
+```{r} 
+# Set up features from uniprot
+uniprotHsIso <- uniprotHsIso %>% 
+        mutate(seqLength = str_length(sequence),
+             kCount = str_count(sequence, "K"))
+numSitesPerprot <- left_join(numSitesPerprot, uniprotHsIso[, c("uniprotkb", "seqLength", "kCount")] %>% 
+                                                dplyr::rename("uniprot" = "uniprotkb"), 
+                                                by = "uniprot")
+numSitesPerprot <- left_join(numSitesPerprot, distinct(buildDat[, c("uniprot", "abundance")]), 
+                                                by = "uniprot")
+
+# Plot
+prefix <- "output/images/overview/pplot_numSites_vs_"
+plot_params <- list(
+  list(var = "abundance", yaxis = "Protein abundance (ppm)"),
+  list(var = "seqLength", yaxis = "Protein length"),
+  list(var = "kCount",    yaxis = "# lysines per protein")
+)
+plot_list <- list()
+for (i in 1:length(plot_params)){
+  param <- plot_params[[i]]
+  var <- param$var
+  yaxis <- param$yaxis
+  p <- ggplot(numSitesPerprot, aes(y = !!sym(var), x = numSites)) +
+         geom_point(shape = 16, alpha = 0.25, size = 0.5, colour = "#28275d") +
+         comfy_theme() + scale_x_log10() + scale_y_log10() +
+         labs(x = "# ubi-sites per protein", y = yaxis)
+  plot_list[[i]] <- p
+}
+ggarrange(plotlist = plot_list, nrow = 1)
+ggsave_pdfpng(file = paste0(prefix, "allVars"), height = 1.6, width = 1.75*3)
+```
+
+
+
+## GO enrichment
+```{r}
+# Set up
+onts <- list(BP = "BP", MF = "MF", CC = "CC")
+
+# All proteins with ubisites
+background_genes <- unique(uniprotHsRevi$uniprotkb) #Use the reviewed proteome without isoforms
+DE_genes <- unique(buildDat$uniprot)
+GOresList_allProts <- lapply(onts, function(ont) {
+  GO_enricher(background_genes = background_genes,
+              DE_genes = DE_genes,
+              gene_label = "UNIPROT",
+              organism_database = org.Hs.eg.db,
+              ontology = ont,
+              pathway_DE_intersection_threshold = 3,
+              alternative = "greater")
+})
+
+# Proteins with > X ubisites vs anythign with a ubi-site
+background_genes <- unique(buildDat$uniprot) #Use all proteins with ubi-sites
+DE_genes <- subset(numSitesPerprot, numSites >= 11)$uniprot %>% unique
+GOresList_manySites <- lapply(onts, function(ont) {
+  GO_enricher(background_genes = background_genes,
+              DE_genes = DE_genes,
+              gene_label = "UNIPROT",
+              organism_database = org.Hs.eg.db,
+              ontology = ont,
+              pathway_DE_intersection_threshold = 3,
+              alternative = "greater")
+})
+View(head(GOresList_manySites$BP, 20))
+
+
+# Plot
+for (ont in names(GOresList_manySites)) {
+  enrichment_barplot_pval(
+    data = GOresList_manySites[[ont]] %>% arrange(adj_pval) %>% head(15),
+    pval_col = "adj_pval",
+    colour_col = "ES_log2",
+    colours = brewer.pal(9, "RdBu"),
+    order_col = "adj_pval",
+    order_decreasing = TRUE,
+    sig_line = FALSE,
+    xlab = "-log10 adj. p-value",
+    legend_title = "Fold enrichment (log2)"
+  )  + 
+  ggtitle("Proteins with > 10 ubi-sites")
+  ggsave_pdfpng(file = paste0("output/images/overview/enrichment/bplot_GOenr_geq11_", ont),
+                width = 4.25, height = 2.4)
+}
+```
+
+
+## Comparison to PhosphositePlus
+### Set up numbers
+```{r}
+# PhosphositePlus
+## Load all PSP ubi sites and prep
+PSPDir <- paste(home_directory, "data/biol_databases/phosphosite_plus/DATE", sep = "")
+f <- "Ubiquitination_site_dataset"
+PSP_ubn_raw <- read_delim(file.path(PSPDir, f)) %>%
+  as.data.frame
+PSP_ubn_hs <- subset(PSP_ubn_raw, ORGANISM == "human") %>% 
+              mutate(site = gsub("-ub$", "", MOD_RSD)) %>% 
+              mutate(uniprot_site = paste(ACC_ID, site, sep = "_"))
+## Evidence of identification
+PSP_ubn_hs$MS_LIT[which(is.na(PSP_ubn_hs$MS_LIT))] <- 0
+PSP_ubn_hs$MS_CST[which(is.na(PSP_ubn_hs$MS_CST))] <- 0
+PSP_ubn_hs <- mutate(PSP_ubn_hs, MS_total = MS_LIT + MS_CST) # Sum LIT and CST evidence
+
+# PRIDE build
+PXDIds <- colnames(buildPos)[grep("^PXD", colnames(buildPos))] %>% gsub("_.+", "", .) %>% unique
+FLR_cols <- paste(PXDIds, "_FLR", sep = "")
+# Count number of datasets with FLR < 5%
+buildPos$FLR5count <- rowSums(buildPos[, FLR_cols] < 0.05, na.rm = T)
+
+# Combine
+PSP_PRIDE_MS2nums <- map_dfr(list("PSP" = PSP_ubn_hs[, c("uniprot_site", "MS_total")],
+                                  "PRIDE" = buildPos[, c("uniprot_site", "FLR5count")]),
+                                  function(x){
+                                    colnames(x) <- c("uniprot_site", "MS2_count")
+                                    return(x)
+                                  }, .id = "source") %>% 
+                      subset(MS2_count > 0)
+## Bin summary
+PSP_PRIDE_MS2nums_binSumm <- PSP_PRIDE_MS2nums %>% 
+                binAndSummarise(., bin_breaks = c(0, 1, 2, 3, 4, 5, 6, Inf),
+                            groupCol = "source", valCol = "MS2_count",
+                            breakType = "integer")
+levels(PSP_PRIDE_MS2nums_binSumm$Bin) <- gsub("^([0-9]+)-\\1$", "\\1", levels(PSP_PRIDE_MS2nums_binSumm$Bin))
+PSP_PRIDE_MS2nums_binSumm$sourceLabel <- factor(PSP_PRIDE_MS2nums_binSumm$source,
+  levels = c("PRIDE", "PSP"),
+  labels = c("PRIDE (11 datasets)", "PSP (> 150 datasets)")
+)
+### Plot
+n <- length(levels(PSP_PRIDE_MS2nums_binSumm$Bin))
+#palette <- rev(brewer.pal(9, "Blues")[c(2, 4, 6, 8)])
+#palette <- rev(brewer.pal(n, "Blues"))
+palette <- rev(brewer.pal(9, "Blues")[c(1, 3, 4, 6, 8, 9)])
+ggplot(PSP_PRIDE_MS2nums_binSumm, aes(x = sourceLabel, y = n, fill = factor(Bin, levels = rev(levels(Bin))))) +
+  geom_col(position = "stack", colour = "#3a3a3a", linewidth = 0.235/2) +
+  scale_fill_manual(values = palette) +
+  comfy_theme(include_xaxis = F, rotate_x_text = F) + 
+  theme(axis.title.x = element_blank()) +
+  labs(x = "Source", y = "# human ubi-sites", fill = "# datasets") + 
+  ggtitle("Site identification across MS datasets")
+ggsave_pdfpng(file = "output/images/overview/PRIDE/vsPSP/bplot_numMS2", width = 2.25, height = 1.75)
+```
+
+### Overlap with PSP 
+```{r}
+# Make a list of dataframes containing sites
+sitelst_usVsPsp <- PSP_PRIDE_MS2nums %>% 
+  mutate(source = factor(source, levels = c("PRIDE", "PSP"), labels = c("This study", "PhosphositePlus"))) %>% 
+  split(.$source)
+
+# Plot venn diagram
+map(sitelst_usVsPsp, ~unique(.$uniprot_site)) %>% 
+  ggVennDiagram_nice(.)  +
+  ggtitle("Overlap of ubi-sites")
+ggsave_pdfpng(file = "output/images/overview/PRIDE/vsPSP/venn_numSites_usVsPSP",
+              width = 3.5, height = 3.5)
+
+# Only sites supported by >= 2 databases
+map(sitelst_usVsPsp, function(x){
+  unique(subset(x, MS2_count > 1)$uniprot_site)
+}) %>% 
+  ggVennDiagram_nice(.)  +
+  ggtitle("Overlap of ubi-sites")
+ggsave_pdfpng(file = "output/images/overview/PRIDE/vsPSP/venn_numSites_usVsPSP_MSgeq2",
+              width = 3.5, height = 3.5)
+```
+
+
+## Overlap with Wen 2025 Nature methods
+I compare to sites identified by re-searching mass spec data in Wen 2025 (doi.org/10.1038/s41592-025-02797-x)
+```{r}
+# Prep data
+PTMatlasComb <- read_csv(paste0(home_directory, "data/supplementary_tables/Wen_NatMethods_2025/PTMatlasComb.csv"))
+PTMatlasUbi <- subset(PTMatlasComb, PTM == "ubiquitination") %>% 
+  mutate(uniprot_site = paste0(protein, "_", aa, pos))
+
+# Get list of sites
+sitelst_usVsPspVsptmatlas <- sitelst_usVsPsp
+sitelst_usVsPspVsptmatlas$PTMAtlas <- PTMatlasUbi
+
+# Plot venn diagram
+siteLst <- map(sitelst_usVsPspVsptmatlas, ~unique(.$uniprot_site))
+map(siteLst) %>% 
+  ggVennDiagram_nice(.)  +
+  ggtitle("Overlap of ubi-sites")
+ggsave_pdfpng(file = "output/images/overview/PRIDE/vsPSP/venn_numSites_usVsPSPVsPTMAtlas",
+              width = 4.5, height = 4.5)
+
+# Individual numbers
+map(siteLst, length)
+length(intersect(siteLst$`This study`, siteLst$PhosphositePlus))
+length(intersect(siteLst$`This study`, siteLst$PTMAtlas))
+
+# Is it our bronze sites that are unique?
+ourSitesCat <- buildPos %>% split(.$PTM_FLR_category) %>% map(~unique(.$uniprot_site))
+map(ourSitesCat, length)
+map(ourSitesCat, ~length(setdiff(., siteLst$PTMAtlas)))
+map(ourSitesCat, ~length(setdiff(., c(siteLst$PTMAtlas, siteLst$PhosphositePlus))))
+```
+
+What PRIDE datasets do they look at vs us?
+```{r}
+# Load
+PTMatlasDatasets <- read_xlsx(paste0(home_directory, "data/supplementary_tables/Wen_NatMethods_2025/Table_S1.xlsx"), 
+                              sheet = "S1", skip = 2)
+ourDatasets <- read_xlsx("data/supp_tables/SuppTable_PRIDE_datasets.xlsx", sheet = "table")
+# Extract datasets
+datasetsLst <- list()
+datasetsLst$`This study` <- ourDatasets$Datasets %>% gsub("-.+$", "", .) %>% unique
+#datasetsLst$`This study` <- ourDatasets$`Pubmed ID` %>% unique
+datasetsLst$PTMAtlas <- subset(PTMatlasDatasets, PTM == "Ubiquitination")$Dataset
+#datasetsLst$PTMAtlas <- subset(PTMatlasDatasets, PTM == "Ubiquitination")$PMID
+# Overlap 
+ggVennDiagram_nice(datasetsLst)
+datasetsTab <- data.frame("Dataset" = unique(unlist(datasetsLst)))
+for (name in names(datasetsLst)){
+  datasetsTab[, name] <- datasetsTab$Dataset %in% datasetsLst[[name]]
+}
+View(datasetsTab)
+```

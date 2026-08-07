@@ -1,0 +1,509 @@
+# Background
+Here I analyse the accuracy of the model within individual proteins
+
+# Initialise
+NOTE: This entire section will easily take 5-10min to run
+```{r}
+library(tidyverse)
+library(purrr)
+library(ggplot2)
+library(ggridges)
+library(readxl)
+library(openxlsx)
+library(data.table)
+library(caret)
+
+home_directory <- ""
+source(paste0(home_directory, "scripts/essential_visualisations_JvG.R"))
+source(paste0(home_directory, "scripts/enrichment_analysis_JvG.R"))
+source(paste0(home_directory, "scripts/caret_JvG.R"))
+source("scripts/01_general.R")
+source("scripts/00_objects.R")
+source("scripts/03_visualisations.R")
+source("scripts/04_ubnOmics.R")
+source("scripts/02_model_training.R")
+source("scripts/16_model_accuracy.R") # Auxiliary functions for assessing accuracy
+
+# Load data
+load("data/functional_scores/ubiFeatPreds__7.RData")
+load("data/features/ubnOmics/ubnOmicsFeauresAll__4.RData")
+load("data/features/ubnOmics/ubnOmicsComp_hsPRIDE_lst__8.RData")
+load("data/hotspots/hotspotSites__3.RData")
+load("data/functional_scores/datFeats__7.RData")
+
+#Set up bin breaks for the functional score, and other aesthetic paramters
+funcScoreBreaks <- c(0, 0.2, 0.4, 0.6, 0.8, 1)
+funcScoreBinCols <- brewer.pal(9, "Blues")[c(1, 3, 5, 7, 9)]
+funcScoreFillAlpha <- 0.3
+
+#Get gene identifiers for our ubi sites
+library(AnnotationDbi)
+library(org.Hs.eg.db)
+collapseFunc <- function(x){
+    x <- unique(x)
+    if (is.na(x[1])){
+        return(NA)
+    } else {
+        return(paste(x, collapse = ";"))
+    }
+}
+geneMap <- AnnotationDbi::select(org.Hs.eg.db, keys = unique(ubiFeatPreds$uniprot), keytype = "UNIPROT",
+                                    columns = c("SYMBOL")) %>% 
+                                group_by(UNIPROT) %>% 
+                                summarise(gene = collapseFunc(SYMBOL))
+ubiFeatPreds <- left_join(ubiFeatPreds, dplyr::rename(geneMap, "uniprot" = "UNIPROT"), by = "uniprot")
+##Expand out by gene when they are not unique
+ubiFeatPreds_byGene <- separate_rows(ubiFeatPreds, "gene", sep = ";") %>% 
+                        mutate(gene_site = paste(gene, site, sep = "_")) 
+
+# Load clinvar
+load("output/data/genetics/clinvarDatSub__2.RData")
+clinvarDatSub <- subset(clinvarDatSub, grepl("missense_variant", MC))
+clinvarDatSub <- clinvarDatSub %>% mutate(clinvar_label = factor(clinvar_label, levels = c("Benign", "VUS", "Pathogenic")))
+levels(clinvarDatSub$clinvar_label)[2] <- "Uncertain" 
+
+# Load base editing
+load("output/data/genetics/LysBEdat_funcScore_sites.RData")
+LysBEdat_funcScore_sites$pos <- gsub("^.+_" ,"", LysBEdat_funcScore_sites$aa_id)
+
+# Load NLS
+load("output/data/functional_scores/ubiFeatPreds_NLS__7.RData")
+
+## Load protein abundance data
+load("data/features/abundDat__1.RData")
+abundDat$uniprot_pos <- gsub("_K", "_", rownames(abundDat))
+abundDat$uniprot <- gsub("_.+$", "", abundDat$uniprot_pos)
+abundFeatsLog <- colnames(abundDat) %>% .[grep("log$", .)]
+protAbundDat <- abundDat[, c("uniprot", "protAbundance_log")] %>% distinct
+
+# Load PSP annotations
+load("data/PSP/PSP_reg_ubCorr__3.RData")
+```
+
+## Quantile-normalise features within proteins
+```{r}
+cols <- featureCols
+feats_quantNorm <- ubiFeatPreds[, c("uniprot", "uniprot_site", cols)] %>% 
+    pivot_longer(cols = all_of(cols), names_to = "column", values_to = "predCol") %>%  
+    group_by(uniprot, column) %>% 
+    mutate(
+        predColQuant = to_quantiles(predCol), 
+        predColRank = rank(-predCol),
+        numSites = n()) %>% ungroup  %>% 
+    pivot_wider(names_from = "column", values_from = c("predColQuant", "predColRank", "predCol")) 
+# Reorder columns
+colsReord <- map(cols, function(x){colnames(feats_quantNorm)[grep(x, colnames(feats_quantNorm))]}) %>% unlist %>% unique
+colsReord <- c(colsReord, setdiff(colnames(feats_quantNorm), colsReord))
+feats_quantNorm <- feats_quantNorm[, colsReord]
+```
+
+
+
+## Prepare external data to add
+This is done at the level of uniprot_site, so it can be done once and then mapped to multiple datasets more quickly
+```{r}
+# Set up data
+siteData <- distinct(ubiFeatPreds[, c("uniprot", "uniprot_site", "uniprot_pos")])
+
+# Add prtsm inhib data
+prtsmInhibCols <- c("Bortezomib_meanlog2FC", "MG-132_meanlog2FC", "Epoxomicin_meanlog2FC")
+if (length(intersect(prtsmInhibCols, colnames(siteData))) == 0){
+    siteData <- left_join(siteData, ubnOmicsFeaturesAll[, c("uniprot_pos", prtsmInhibCols)],
+                                by = "uniprot_pos")
+}
+
+# Add clinvar data
+useStars <- FALSE
+CVdatFilt <- clinvarDatSub # Optional filtering here
+siteData$clinvarClass <- NA
+levels <- c("Uncertain", "Benign", "Pathogenic") # This degines the order of evidence. Pathogenic trumps all
+if (useStars){
+    for (lev in levels){
+        siteData$clinvarClass[which(siteData$uniprot_site %in% subset(CVdatFilt, clinvar_label == lev & CLNREVSTAT_STARS == 1)$uniprot_site)] <- paste0(lev, "_1star")
+        siteData$clinvarClass[which(siteData$uniprot_site %in% subset(CVdatFilt, clinvar_label == lev & CLNREVSTAT_STARS > 1)$uniprot_site)] <- paste0(lev, "_2+star")
+    }
+    siteData$clinvarClass <- factor(siteData$clinvarClass, levels = sort(unique(siteData$clinvarClass[which(!is.na(siteData$clinvarClass))])))
+} else {
+    for (lev in levels){
+        siteData$clinvarClass[which(siteData$uniprot_site %in% subset(CVdatFilt, clinvar_label == lev)$uniprot_site)] <- lev
+    }
+    siteData$clinvarClass <- factor(siteData$clinvarClass, levels = levels)
+}
+
+# Add base editing data
+siteData <- left_join(
+    siteData, 
+    LysBEdat_funcScore_sites[, c("aa_id", "typeLabel")] %>% dplyr::rename("uniprot_pos" = "aa_id", "BE_typeLabel" = "typeLabel")
+    )
+
+# Add abundance
+siteData <- left_join(
+    siteData, 
+    abundDat
+    )
+
+# Add NLS data
+siteData <- left_join(siteData, ubiFeatPreds_NLS)
+
+# Add PSP annotations
+siteData <- left_join(siteData, PSP_reg_ubCorr[, c("uniprot_site", "ON_PROCESS", "ON_FUNCTION")])
+
+# Add gene names
+siteData <- left_join(siteData, distinct(ubiFeatPreds[, c("uniprot_site", "gene")]))
+
+# Add # regulatory sites
+numRegSites <- ubiFeatPreds %>% group_by(uniprot) %>% 
+    summarise(numReg_notProtDeg = sum(PSP_reg_notProtDeg), numReg_protDeg = sum(PSP_reg_ProtDeg)) %>% ungroup
+siteData <- left_join(siteData, numRegSites, by = "uniprot") %>% 
+    dplyr::relocate(colnames(numRegSites))
+```
+
+## Load test-set predictions
+### Load predictions on all sites and subset for those not in training
+This ensures that sites excluded from the entire training process will still be there. 
+For these, I include them only in test sets where the entire protein was included
+```{r}
+# Load
+suffix <- "attempt11_revisions"
+load(paste0("output/data/functional_scores/allPredsLstDf__", suffix, ".RData")) # Load predictions
+load(paste0("output/data/functional_scores/trainTestforPredSplits__", suffix, ".RData")) # Load train-test splits
+# Subset for data not in training
+testSetPreds_wAll <- allPredsLstDf
+testSetPreds_wAll$uniprot <- gsub("_[A-Z].+$", "", testSetPreds_wAll$uniprot_site)
+testSetPreds_wAll$retain <- F
+for (resamp in names(trainTestforPredSplits)){
+    testDat <- trainTestforPredSplits[[resamp]]$testDat
+    testProts <- unique(gsub("_.+$", "", rownames(testDat)))
+    testSetPreds_wAll$retain[which(testSetPreds_wAll$fold == resamp & testSetPreds_wAll$uniprot %in% testProts)] <- T
+}
+testSetPreds_wAll <- subset(testSetPreds_wAll, retain == T) %>% dplyr::select(-c("retain"))
+```
+
+
+### Load only test-set predictions  
+This excludes sites that were not in training at all e.g. degradation sites
+```{r}
+# Load
+load(paste0("output/data/functional_scores/modsPreds_trainTestforPred_df__", suffix, ".RData"))
+testSetPreds <- modsPreds_trainTestforPred_df 
+```
+
+### Process and add features
+```{r}
+datLst <- list("testSetPreds_wAll" = testSetPreds_wAll, "testSetPreds" = testSetPreds)
+
+# Process
+datLst <- map(datLst, function(data){
+    # Add columns and data
+    # Add identifier columns
+    data$Resample <- data$fold
+    data$uniprot <- gsub("_[A-Z].+$", "", data$uniprot_site)
+    data$uniprot_pos <- gsub("_[A-Z]", "_", data$uniprot_site)
+    # Assign prediction column
+    predCol <- "X1"
+    data$predCol <- data[[predCol]]
+    # Quantile-normalise within proteins
+    data <- data %>% group_by(uniprot, Resample) %>% 
+        mutate(
+            predColQuant = to_quantiles(predCol), 
+            predColRank = rank(-predCol),
+            numSites = n()) %>% ungroup 
+    data$predColPercentile <- 100*data$predColQuant
+
+    # Add features
+    cols_to_add <- setdiff(colnames(siteData), colnames(data))
+    if (length(cols_to_add) > 0){
+        data <- left_join(data, siteData[, c(cols_to_add, "uniprot_site")], by = "uniprot_site")
+    }
+    return(data)
+})
+testSetPreds_wAll <- datLst$testSetPreds_wAll
+testSetPreds <- datLst$testSetPreds
+
+# Map training class annotations in
+testSetPreds_wAll <- left_join(testSetPreds_wAll, distinct(testSetPreds[, c("uniprot_site", "obs")]), by = "uniprot_site")
+
+# Subset for proteins with regulatory sites
+regProts <- subset(testSetPreds, obs == "X1")$uniprot %>% unique
+testSetPreds_regProts <- subset(testSetPreds, uniprot %in% regProts)
+```
+
+### Take median of values across Resamples
+```{r}
+testSetPreds_wAll_summ <- testSetPreds_wAll %>% 
+    group_by(uniprot_site) %>%
+    summarise(
+        across(where(is.numeric), ~ median(.x, na.rm = TRUE)),
+        across(where(~ !is.numeric(.x)), dplyr::first),
+        .groups = "drop"
+    )
+
+# Add median test-set score to ubiFeatPreds
+ubiFeatPreds <- left_join(
+    ubiFeatPreds,
+    testSetPreds_wAll_summ[, c("uniprot_site", "predCol")] %>% dplyr::rename("functional_score_testSet" = "predCol"),
+    by = "uniprot_site"
+)
+```
+
+
+
+# Inspect quantile-normalised scores for proteins with regulatory sites
+## Summarise data at different levels
+```{r}
+outputDir <- "output/images/functional_scores/withinProtein/"
+
+##### For training data sites #####
+regSiteDat <- subset(testSetPreds, obs == "X1") 
+# Median across resamples
+regSiteDat_ResampleSumm <- regSiteDat %>% group_by(uniprot_site) %>% 
+    summarise(predColPercentile = median(predColPercentile), predColRank = median(predColRank), uniprot = uniprot[1]) %>% ungroup 
+# Max within proteins
+regSiteDat_protMax <- regSiteDat %>% group_by(uniprot, Resample) %>% 
+    summarise(predColPercentile = max(predColPercentile), predColRank = min(predColRank)) %>% ungroup
+# Combining the two
+regSiteDat_summToMax <- regSiteDat_ResampleSumm %>% group_by(uniprot) %>% 
+    summarise(predColPercentile = max(predColPercentile), predColRank = min(predColRank)) %>% ungroup
+regSiteDat_maxToSumm <- regSiteDat_protMax %>% group_by(uniprot) %>% 
+    summarise(predColPercentile = median(predColPercentile), predColRank = median(predColRank)) %>% ungroup
+```
+
+
+## Plot quantile-normalised scores 
+```{r}
+# Function
+quantile_violin <- function(data){
+    data$dummy <- "a"
+    plt <- ViolBoxplot(data, vars = list(x = "dummy", colour = 'dummy', fill = "dummy", y = "predColPercentile"),
+                includeLegend = F) + labs(y = "Score percentile within protein") +
+        theme(axis.text.x = element_blank(), axis.title.x = element_blank()) +
+        scale_y_continuous(breaks = seq(0, 100, by = 20)) + 
+        scale_colour_manual(values = ubiSiteColour) + 
+        scale_fill_manual(values = alpha(ubiSiteColour, 0.1))
+    return(plt)
+}
+##### For training data sites #####
+# All data
+quantile_violin(regSiteDat_ResampleSumm) + ggtitle("Regulatory sites")
+ggsave_pdfpng(file = paste0(outputDir, "viol_scoreQuant_", "ResampSumm"), width = 1.5, height = 1.5)
+# Protein max, averaged across resamples
+quantile_violin(regSiteDat_maxToSumm) + ggtitle("Max per protein")
+ggsave_pdfpng(file = paste0(outputDir, "viol_scoreQuant_", "maxToSumm"), width = 1.5, height = 1.5)
+```
+
+Compare to protein abundance
+```{r}
+# Add protein abundance
+regSiteDat_ResampleSumm <- left_join(regSiteDat_ResampleSumm, distinct(abundDat[, c("uniprot", "protAbundance_log")]), by = "uniprot")
+ggplot(regSiteDat_ResampleSumm, aes(x = protAbundance_log, y = predColPercentile)) + 
+    geom_point(shape = 16, size = 1, alpha = 0.7) + 
+    comfy_theme()
+ggsave_pdfpng(file = paste0(outputDir, "pplot_scoreQuant_vs_protAbund_ResampSumm"), width = 2, height = 2)
+```
+
+
+## Inspect ranks for regulatory sites
+```{r}
+# Function to plot number of sites at each rank level
+plot_rank_barplot <- function(data, rankLimit = 5, rankCol = predColRank, ylab = "% of sites"){
+    rankCol <- enquo(rankCol)
+
+    rankSumm <- data %>%
+        mutate(
+            rankBin = case_when(
+                is.na(!!rankCol) ~ NA_character_,
+                !!rankCol >= rankLimit ~ paste0(">=", rankLimit),
+                TRUE ~ as.character(as.integer(!!rankCol))
+            ),
+            rankBin = factor(
+                rankBin,
+                levels = c(as.character(seq_len(rankLimit - 1)), paste0(">=", rankLimit))
+            )
+        ) %>%
+        filter(!is.na(rankBin)) %>%
+        dplyr::count(rankBin, name = "count") %>%
+        mutate(percent = 100 * count / sum(count))
+    levels(rankSumm$rankBin) <- sapply(levels(rankSumm$rankBin), function(x){
+        if (sum(grepl(">=", x, fixed = T)) > 0){
+            x <- gsub(">=", "", x, fixed = T)
+            x <- paste0(x, "+")
+            return(x)
+        } else {return(x)}
+    })
+
+    ggplot(rankSumm, aes(x = rankBin, y = percent)) +
+        geom_col(width = 0.8, size = 0.235/2, fill = alpha(ubiSiteColour, 0.75), colour = ubiSiteColour) +
+        labs(x = "Score rank within protein", y = ylab) +
+        scale_y_continuous(breaks = seq(0, 100, by = 20)) +
+        comfy_theme()
+}
+##### For training data sites #####
+# All data
+plot_rank_barplot(regSiteDat_ResampleSumm, rankLimit = 6) + ggtitle("Regulatory sites")
+ggsave_pdfpng(file = paste0(outputDir, "bar_scoreRank_", "ResampSumm"), width = 1.5, height = 1.7)
+# Protein max, averaged across resamples
+plot_rank_barplot(regSiteDat_maxToSumm, rankLimit = 6, ylab = "% of proteins") + ggtitle("Max per protein")
+ggsave_pdfpng(file = paste0(outputDir, "bar_scoreRank_", "maxToSumm"), width = 1.5, height = 1.7)
+```
+
+
+# Inspect sites that are top-ranked within their protein
+```{r}
+rank1Sites <- subset(regSiteDat_ResampleSumm, predColRank == 1)$uniprot_site
+rank1Sites_info <- subset(testSetPreds, uniprot_site %in% rank1Sites) %>% 
+    group_by(uniprot_site) %>%
+    summarise(
+        across(where(is.numeric), ~ median(.x, na.rm = TRUE)),
+        across(where(~ !is.numeric(.x)), dplyr::first),
+        .groups = "drop"
+    )
+```
+
+## Export all sites for inspection
+```{r}
+regSites_info <- subset(testSetPreds_wAll_summ, obs == "X1") 
+# Add quantile-normalised features
+regSites_info <- left_join(
+    regSites_info, 
+    feats_quantNorm %>% dplyr::select(-c("uniprot", "numSites")), 
+    by = "uniprot_site")
+# Order
+regSites_info <- regSites_info %>% .[order(.$predColRank, -.$predCol, decreasing = F), ]
+# Export
+write.csv(regSites_info, file = "output/data/functional_scores/withinProteins/regSites_info.csv", na = "")
+```
+
+
+
+# Plot lollypop plots for rank-1 proteins
+```{r}
+# Select favourite sites
+unipSiteVec <- c(
+    "P46783_K138", #
+    "P22314_K604", #
+    "P60866_K8", #
+    "Q13164_K184", #
+    "Q15004_K24", #
+    "P51149_K38", #
+    "P54252_K117", #
+    "O14757_K132", #
+    "Q9BXW9_K561", #
+    "O43318_K158", #
+    "P49915_K182", #
+    "Q9NVI1_K523", #
+    "Q96BN8_K66", #
+    "O94992_K289" #
+)
+
+unipVec <- unique(gsub("_.+$", "", unipSiteVec))
+
+# Set up domains
+domainListList <- map(unipVec, function(unip){
+    ind <- which(ubiFeatPreds$uniprot == unip)
+    domainsList <- list("a" = c(1, ubiFeatPreds$proteinLength[ind[1]]))
+    names(domainsList)[1] <- ubiFeatPreds$gene[ind[1]]
+    return(domainsList)
+})
+names(domainListList) <- unipVec
+## Make domains
+domainListList <- list( # From PhosphositePlus unless otherwise specified
+    "Q9NVI1" = list(  # pfam
+            "Cap" = c(1, 53),
+            "S1" = c(64, 280),
+            "HD1" = c(284, 370),
+            "S2" = c(378, 541),
+            "HD2" = c(555, 785),
+            "S3" = c(804, 1032),
+            "S4" = c(1045, 1294)
+            ),
+
+    "P46783" = list(  
+            "S10_plectin" = c(3, 98)
+            ),
+
+
+    "P22314" = list(  # From pfam
+            "FCCH" = c(227, 296),
+            "4HB" = c(297, 366),
+            "ThiF" = c(451, 637),
+            "SCCH" = c(638, 884),
+            "Thif" = c(885, 946),
+            "UFD" = c(955, 1053)
+            ),
+    
+    "P60866" = list(  
+            "Ribosomal_S10" = c(21, 115)
+            ),
+
+
+    "Q13164" = list(  
+            "Pkinase" = c(55, 347)
+            ),
+
+    "Q15004" = list(  
+            "PAF" = c(1, 111)
+            ),
+
+    "P51149" = list(  
+            "Ras" = c(10, 175)
+            ),
+
+    "P54252" = list(  
+            "Josephin" = c(9, 166),
+            "UIM" = c(224, 240),
+            "UIM" = c(244, 260),
+            "SUIM_assoc" = c(263, 329),
+            "UIM" = c(335, 351)
+            ),
+
+    "O14757" = list(  
+            "Pkinase" = c(9, 265)
+            ),
+
+    "Q9BXW9" = list(  
+            "FancD2" = c(1, 1414)
+            ),
+
+    "O43318" = list(  
+            "PK_Tyr_Ser-Thr" = c(36, 284)
+            ),
+
+    "P49915" = list(  
+            "GATase" = c(20, 210),
+            "NAD_synthase" = c(219, 349),
+            "GMP_synt_C" = c(597, 692)
+            ),
+
+    "Q96BN8" = list(  
+            "Peptidase_C101" = c(80, 344)
+            ),
+
+    "O94992" = list(  
+            "HEXIM" = c(164, 301)
+            )
+)
+
+
+# Make plots
+yArgs <- list(
+    list("functional_score", "Importance score", "finalScore"),
+    list("functional_score_testSet", "Importance score (test set median)", "testSetScore")
+)
+for (unipSel in unipVec){
+    ubiFeat_sub <- subset(ubiFeatPreds, uniprot == unipSel)
+    gene <- ubiFeat_sub$gene[1]
+    domainsList <- domainListList[[unipSel]]
+    ## Plot, either final score or test-set score
+    for (arg in yArgs){
+        plot_lollipop(data = ubiFeat_sub, 
+            domains = domainsList, 
+            aes_colour = "PSP_reg_notProtDeg", aes_size = "PSP_reg_notProtDeg", # For now, show non-degradation sites
+            colour_values = setNames(c("#203569", "#c7dfec"), c(T, F)), 
+            size_values = setNames(c(2.5, 1.5), c(T, F)),
+            ycol = arg[[1]], sitesToLabel = subset(ubiFeat_sub, PSP_reg_notProtDeg == T)$uniprot_site) + 
+            labs(y = arg[[2]]) + theme(axis.title.x = element_blank())
+        ggsave_pdfpng(file = paste0("output/images/functional_scores/withinProtein/examples/lolly_", gene, "_", unipSel, "_", arg[[3]]),
+                        width = 2.4, height = 1.25)
+    }
+}
+```

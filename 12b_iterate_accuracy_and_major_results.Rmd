@@ -1,0 +1,371 @@
+# Background
+Here I build a pipeline to assess model accuracy and major results.
+This can be applied to different trainings of the model and individual features.
+
+
+# Initialise
+```{r}
+library(tidyverse)
+library(purrr)
+library(ggplot2)
+library(ggridges)
+library(readxl)
+library(openxlsx)
+library(data.table)
+library(caret)
+
+home_directory <- ""
+source(paste0(home_directory, "scripts/essential_visualisations_JvG.R"))
+source(paste0(home_directory, "scripts/enrichment_analysis_JvG.R"))
+source(paste0(home_directory, "scripts/caret_JvG.R"))
+source("scripts/01_general.R")
+source("scripts/00_objects.R")
+source("scripts/03_visualisations.R")
+source("scripts/04_ubnOmics.R")
+source("scripts/02_model_training.R")
+source("scripts/16_model_accuracy.R") # Auxiliary functions for assessing accuracy
+
+# Load features
+load("data/features/ubnOmics/ubnOmicsFeauresAll__4.RData")
+
+
+# Load clinvar
+load("output/data/genetics/clinvarDatSub__2.RData")
+clinvarDatSub <- subset(clinvarDatSub, grepl("missense_variant", MC))
+clinvarDatSub <- clinvarDatSub %>% mutate(clinvar_label = factor(clinvar_label, levels = c("Benign", "VUS", "Pathogenic")))
+levels(clinvarDatSub$clinvar_label)[2] <- "Uncertain" 
+
+# Load base editing
+load("output/data/genetics/LysBEdat_funcScore_sites.RData")
+LysBEdat_funcScore_sites$pos <- gsub("^.+_" ,"", LysBEdat_funcScore_sites$aa_id)
+
+# Load NLS
+load("output/data/functional_scores/ubiFeatPreds_NLS__7.RData")
+
+## Load protein abundance data
+load("data/features/abundDat__1.RData")
+abundDat$uniprot_pos <- gsub("_K", "_", rownames(abundDat))
+abundDat$uniprot <- gsub("_.+$", "", abundDat$uniprot_pos)
+abundFeatsLog <- colnames(abundDat) %>% .[grep("log$", .)]
+protAbundDat <- abundDat[, c("uniprot", "protAbundance_log")] %>% distinct
+```
+
+
+# Load data to test
+## Load current set predictions
+Here suffix indicates the latest model
+```{r}
+# Load
+suffix <- "attempt11_revisions"
+load(paste0("output/data/functional_scores/modsPreds_trainTestforPred_df__", suffix, ".RData"))
+testSetPreds <- modsPreds_trainTestforPred_df 
+testSetPreds$uniprot <- gsub("_[A-Z].+$", "", testSetPreds$uniprot_site)
+testSetPreds$uniprot_pos <- gsub("_[A-Z]", "_", testSetPreds$uniprot_site)
+```
+
+# Prepare external data to add
+This is done at the level of uniprot_site, so it can be done once and then mapped to multiple datasets more quickly
+```{r}
+# Set up data
+siteData <- distinct(testSetPreds[, c("uniprot", "uniprot_site", "uniprot_pos")])
+
+# Add prtsm inhib data
+prtsmInhibCols <- c("Bortezomib_meanlog2FC", "MG-132_meanlog2FC", "Epoxomicin_meanlog2FC")
+if (length(intersect(prtsmInhibCols, colnames(siteData))) == 0){
+    siteData <- left_join(siteData, ubnOmicsFeaturesAll[, c("uniprot_pos", prtsmInhibCols)],
+                                by = "uniprot_pos")
+}
+
+# Add clinvar data
+useStars <- FALSE
+CVdatFilt <- clinvarDatSub # Optional filtering here
+siteData$clinvarClass <- NA
+levels <- c("Uncertain", "Benign", "Pathogenic") # This degines the order of evidence. Pathogenic trumps all
+if (useStars){
+    for (lev in levels){
+        siteData$clinvarClass[which(siteData$uniprot_site %in% subset(CVdatFilt, clinvar_label == lev & CLNREVSTAT_STARS == 1)$uniprot_site)] <- paste0(lev, "_1star")
+        siteData$clinvarClass[which(siteData$uniprot_site %in% subset(CVdatFilt, clinvar_label == lev & CLNREVSTAT_STARS > 1)$uniprot_site)] <- paste0(lev, "_2+star")
+    }
+    siteData$clinvarClass <- factor(siteData$clinvarClass, levels = sort(unique(siteData$clinvarClass[which(!is.na(siteData$clinvarClass))])))
+} else {
+    for (lev in levels){
+        siteData$clinvarClass[which(siteData$uniprot_site %in% subset(CVdatFilt, clinvar_label == lev)$uniprot_site)] <- lev
+    }
+    siteData$clinvarClass <- factor(siteData$clinvarClass, levels = levels)
+}
+
+# Add base editing data
+siteData <- left_join(
+    siteData, 
+    LysBEdat_funcScore_sites[, c("aa_id", "typeLabel")] %>% dplyr::rename("uniprot_pos" = "aa_id", "BE_typeLabel" = "typeLabel")
+    )
+
+# Add abundance
+siteData <- left_join(
+    siteData, 
+    abundDat
+    )
+
+# Add NLS data
+siteData <- left_join(siteData, ubiFeatPreds_NLS)
+```
+
+## Sites of interest
+```{r}
+sitesOfInterest <- list(
+    "ELAVL1" = "Q15717_K320"
+) %>% map_dfr(function(x){data.frame("uniprot_site" = x)}, .id = "source") %>% 
+    mutate(uniprot = gsub("_.+$", "", uniprot_site))
+#Get gene identifiers 
+library(AnnotationDbi)
+library(org.Hs.eg.db)
+collapseFunc <- function(x){
+    x <- unique(x)
+    if (is.na(x[1])){
+        return(NA)
+    } else {
+        return(paste(x, collapse = ";"))
+    }
+}
+geneMap <- AnnotationDbi::select(org.Hs.eg.db, keys = unique(sitesOfInterest$uniprot), keytype = "UNIPROT",
+                                    columns = c("SYMBOL")) %>% 
+                                group_by(UNIPROT) %>% 
+                                summarise(gene = collapseFunc(SYMBOL))
+sitesOfInterest <- left_join(sitesOfInterest, dplyr::rename(geneMap, "uniprot" = "UNIPROT"))
+```
+
+
+# Function: Run the analysis pipeline
+```{r}
+# Function: Get type of metric from its name
+getMetricName <- function(x){
+    if (length(grep("AUC", x)) > 0){
+        return("AUC")
+    } else if (length(grep("MAD", x)) > 0){
+        return("MAD")
+    } else if (length(grep("_r$", x)) > 0){
+        return("r")
+    } else {
+        return(x)
+    }
+}
+
+# Evaluate predictions across various criteria
+# dataset: Must contain Resample as a column
+predictionEvaluationPipeline <- function(dataset, predCol = "X1"){
+    ##### Compute columns and add features to data #####
+    # Add identifier columns
+    dataset$uniprot <- gsub("_[A-Z].+$", "", dataset$uniprot_site)
+    dataset$uniprot_pos <- gsub("_[A-Z]", "_", dataset$uniprot_site)
+    # Assign prediction column
+    dataset$predCol <- dataset[[predCol]]
+    # Quantile-normalise within proteins
+    dataset <- dataset %>% group_by(uniprot, Resample) %>% 
+        mutate(
+            predColQuant = to_quantiles(predCol), 
+            predColRank = rank(-predCol),
+            numSites = n()) %>% ungroup 
+    
+    # Add features
+    cols_to_add <- setdiff(colnames(siteData), colnames(dataset))
+    if (length(cols_to_add) > 0){
+        dataset <- left_join(dataset, siteData[, c(cols_to_add, "uniprot_site")], by = "uniprot_site")
+    }
+    # Add column for negative trainign class and not benign
+    dataset$negClassNotBenign <- dataset$obs == "X0" & (dataset$clinvarClass != "Benign" | is.na(dataset$clinvarClass))
+    # Add column for pheno in base editing
+    dataset$BE_hasPheno <- dataset$BE_typeLabel %in% c("Deleterious", "Beneficial")
+
+    ##### Compute metrics #####
+    # Calculate model accuracy
+    AUCresLst <- calculateAUC_withinAndBetweenProts(dat = dataset, predCol = "predCol")
+    AUCresSumm <- summarise_AUC_withinAndBetweenProts(resLst = AUCresLst, metric = "AUC")
+
+    # Calculate MAD for differences within and between proteins
+    MADres <- calculateMAD_withinAndBetweenProts(dataset, predCol = "predCol", removeSingles = T)
+    MADresSumm <- summarise_AUC_withinAndBetweenProts(MADres, metric = "MAD")
+
+    # Association with proteasome inhibition logFC
+    prtmsiCorr <- dataset %>% group_by(Resample) %>% 
+        summarise(
+            Bort_r = cor(Bortezomib_meanlog2FC, predCol, use = "complete.obs"),
+            MG132_r = cor(`MG-132_meanlog2FC`, predCol, use = "complete.obs"),
+            Epox_r = cor(Epoxomicin_meanlog2FC, predCol, use = "complete.obs")
+        ) %>% 
+        ungroup
+
+    # Association with protein abunadnce
+    abundCorr <- dataset %>% group_by(Resample) %>% 
+        summarise(protAbund_r = cor(protAbundance_log, predCol, use = "complete.obs")) %>% ungroup
+
+    # Various binary classification tasks
+    # Set up comparisons: each tuple specifies a column and the corresponding value used for filtering to produce the positive class or negative class
+    comps <- list(
+        "CV_PathVsBenign" = list(list("clinvarClass", "Pathogenic"), list("clinvarClass", "Benign")),
+        "CV_NegclassVsBengin" = list(list("negClassNotBenign", TRUE), list("clinvarClass", "Benign")),
+        "BE_PhenoVsNone" = list(list("BE_hasPheno", TRUE), list("BE_typeLabel", "No effect")),
+        "NLS_InVsOut" = list(list("inNLS", TRUE), list("inNLS", FALSE))
+    )
+    for (i in 1:length(comps)){
+        compName <- names(comps)[i]
+        comp <- comps[[i]]
+        dataset[[compName]] <- NA
+        dataset[[compName]][which(dataset[[comp[[1]][[1]]]] == comp[[1]][[2]])] <- "X1"
+        dataset[[compName]][which(dataset[[comp[[2]][[1]]]] == comp[[2]][[2]])] <- "X0"
+        dataset[[compName]] <- factor(dataset[[compName]], levels = c("X1", "X0"))
+    }
+    # Calculate AUCs across resamples
+    binaryAUCs <- dataset %>% split(.$Resample) %>% map_dfr(function(dat){
+        AUCs <- map(names(comps), ~ROCAUC_fromPredictor(data = dat, obsCol = ., predCol = "predCol"))
+        AUCs_protQuants <- map(names(comps), ~ROCAUC_fromPredictor(data = dat, obsCol = ., predCol = "predColQuant"))
+        data.frame("AUC" = unlist(AUCs), "AUC_protQuants" = unlist(AUCs_protQuants), "name" = names(comps))
+    }, .id = "Resample") %>% pivot_wider(names_from = "name", values_from = c("AUC", "AUC_protQuants"))
+
+    # Combine metrics and summarise
+    combinedMetrics <- pivot_wider(AUCresSumm, names_from = "Regime", values_from = "AUC") %>% 
+        left_join(., pivot_wider(MADresSumm, names_from = "Regime", values_from = "MAD")) %>% 
+        left_join(., prtmsiCorr) %>% 
+        left_join(abundCorr) %>% 
+        left_join(., binaryAUCs)
+    combinedMetricsSumm <- combinedMetrics %>% pivot_longer(cols = setdiff(colnames(.), "Resample"), names_to = "metric", values_to = "value") %>% 
+        group_by(metric) %>% summarise(mean = mean(value, na.rm = T), sd = sd(value, na.rm = T)) %>% ungroup %>% 
+        mutate(metric = factor(metric, levels = intersect(colnames(combinedMetrics), unique(metric)))) %>% 
+        .[order(.$metric), ]
+
+    # Sites of interest
+    sitesOfInterest_wRes <- left_join(sitesOfInterest, dataset[, c("uniprot_site", "predCol", "predColQuant", "predColRank", "numSites", "Resample")], by = "uniprot_site")
+    sitesOfInterest_wResSumm <- sitesOfInterest_wRes %>%
+    dplyr::select(-c("Resample")) %>% 
+    group_by(uniprot_site) %>%
+    summarise(
+        across(where(is.numeric), ~mean(., na.rm = TRUE)),
+        across(where(is.character), ~unique(.)),
+        .groups = "drop"
+    )
+
+    # Final results
+    resultsLst <- list(
+        "combinedMetrics" = combinedMetrics, 
+        "combinedMetricsSumm" = combinedMetricsSumm,
+        "sitesOfInterest_wRes" = sitesOfInterest_wRes,
+        "sitesOfInterest_wResSumm" = sitesOfInterest_wResSumm
+    )
+    return(resultsLst)
+}
+```
+
+
+# Test individual features
+```{r}
+suffix <- "attempt11_revisions"
+
+## Load coefficients
+load(paste0("output/data/functional_scores/finalModel_logregs_coeffs__", suffix, ".RData"))
+
+# Prepare individual features
+load("data/functional_scores/datFeats__7.RData")
+selFeats <- intersect(names(finalModel_logregs_coeffs[[1]]), colnames(datFeats))
+testDf_comb <- left_join(testSetPreds, rownames_to_column(datFeats[, selFeats], "uniprot_site"), by = "uniprot_site") %>% 
+    dplyr::rename("functional_score" = "X1")
+
+# Run through evaluation
+evaluationLstFeats <- list()
+for (col in c("functional_score", selFeats)){
+    res <- predictionEvaluationPipeline(dataset = testDf_comb, predCol = col)
+    evaluationLstFeats[[col]] <- res
+}
+## Combine summaries
+summNames <- names(evaluationLstFeats[[1]]) %>% .[grep("Summ$", .)]
+evaluationCombLstFeats <- map(summNames, function(summName){
+    dat <- map_dfr(evaluationLstFeats, function(x){x[[summName]]}, .id = "model")
+    return(dat)
+})
+names(evaluationCombLstFeats) <- summNames
+save(evaluationCombLstFeats, file = "output/data/functional_scores/featsIndivAblate/evaluationCombLstFeats.RData")
+```
+
+## Inspect results
+```{r}
+# AUCs
+AUCdat <- evaluationCombLstFeats$combinedMetricsSumm %>% 
+    subset(metric == "AUCoverall") 
+AUCdat$AUCabs <- ifelse(AUCdat$mean < 0.5, 1 - AUCdat$mean, AUCdat$mean)
+# Clinvar pathogenic
+evaluationCombLstFeats$combinedMetricsSumm %>% 
+    subset(metric == "AUC_CV_PathVsBenign") %>% 
+    View
+```
+
+
+## Plot results
+```{r}
+for (selMetric in unique(evaluationCombLstFeats$combinedMetricsSumm$metric)){
+    subDat <- subset(evaluationCombLstFeats$combinedMetricsSumm, metric == selMetric) 
+    # Get metric label
+    metricLabel <- getMetricName(selMetric)
+    includeVline <- metricLabel == "AUC"
+    # Plot
+    plt <- bar_meanSd_features(
+        data = subDat, meanCol = "mean", sdCol = "sd", featCol = "model", orderByMean = T,
+        includeVline = includeVline, xLabel = metricLabel) +
+            ggtitle(selMetric) + labs(y = "Feature")
+    plot(plt)
+    ggsave_pdfpng(file = paste0("output/images/functional_scores/featsIndivAblate/bar_", selMetric), width = 3, height = 2.5)
+}
+```
+
+# Ablate individual feaures
+## Retrain models without each feature
+```{r}
+# Set up
+resDir <- "output/data/functional_scores/retrain1BFeatAblate/"
+modNames <- dir(resDir) %>% .[grepl("^modsPredsTest_df_", .)] %>% gsub("modsPredsTest_df_", "", .) %>% gsub(".RData", "", ., fixed = T) %>% rev
+
+# Load training results 
+testDfLst <- list()
+for (modName in modNames){
+    load(paste0(resDir, "modsPredsTest_df_", modName, ".RData"))
+    testDfLst[[modName]] <- modsPredsTest_df
+}
+testDfLst$functional_score <- testSetPreds # Add the score itself
+
+
+# Run through evaluation
+evaluationlst <- map(testDfLst, function(testDf){
+    predictionEvaluationPipeline(dataset = testDf, predCol = "X1")
+})
+## Combine summaries
+summNames <- names(evaluationlst[[1]]) %>% .[grep("Summ$", .)]
+evaluationCombLst <- map(summNames, function(summName){
+    dat <- map_dfr(evaluationlst, function(x){x[[summName]]}, .id = "model")
+    return(dat)
+})
+names(evaluationCombLst) <- summNames
+save(evaluationCombLst, file = paste0(resDir, "evaluationCombLst.RData"))
+#load(paste0(resDir, "evaluationCombLst.RData"))
+```
+
+### Inspect results
+```{r}
+# Clinvar pathogenic
+evaluationCombLst$combinedMetricsSumm %>% 
+    subset(metric == "AUC_CV_PathVsBenign") %>% 
+    View
+```
+
+### Plot results
+```{r}
+for (selMetric in unique(evaluationCombLst$combinedMetricsSumm$metric)){
+    subDat <- subset(evaluationCombLst$combinedMetricsSumm, metric == selMetric) 
+    # Get metric label
+    metricLabel <- getMetricName(selMetric)
+    includeVline <- metricLabel == "AUC"
+    # Plot
+    plt <- bar_meanSd_features(
+        data = subDat, meanCol = "mean", sdCol = "sd", featCol = "model", orderByMean = T,
+        includeVline = includeVline, xLabel = metricLabel) +
+            ggtitle(selMetric) + labs(y = "Removed feature")
+    plot(plt)
+    ggsave_pdfpng(file = paste0("output/images/functional_scores/featsIndivAblate/bar_featRemove_", selMetric), width = 3, height = 2.5)
+}
+```
