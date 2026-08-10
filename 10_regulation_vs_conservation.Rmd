@@ -152,6 +152,52 @@ box_FCs <- function(
     lims(y = yLims)
   return(plt)
 }
+
+# Function: Plot mean +- IQR for FC data
+# xCol and colourCol are factors that are combined for the x-axis
+# Colour is done in blocks, so colourCol specifies the groups and xCol specifies the order within groups
+meanIQR_FCs <- function(
+  dat,
+  logFCcol = "log2FC",
+  xCol = "consBox_LysCont",
+  colourCol = "protAbundance_log_binsLab",
+  yLims = c(-2, 3),
+  hlineInts = c(-1, 0, 1),
+  pointSize = 2.5, errorBarLinewidth = 0.235*2, errorBarWidth = 0
+){
+  # Prep data
+  dat <- dat %>% .[rowSums(is.na(.[, c(logFCcol, xCol, colourCol)])) == 0,  ] %>%
+    as.data.frame
+  ## Combine columns to make one x-axis
+  dat <- dat %>% .[order(.[, colourCol], .[, xCol]), ] %>%
+    mutate(xFact = paste(!!sym(colourCol), !!sym(xCol), sep = "__")) %>%
+    mutate(xFact = factor(xFact, levels = unique(xFact)))
+
+  ## Calculate mean, IQR and numbers to show per group
+  datSummary <- dat %>%
+    group_by(xFact, !!sym(colourCol)) %>%
+    summarise(mean_y = mean(!!sym(logFCcol), na.rm = TRUE),
+              Q1 = quantile(!!sym(logFCcol), 0.25, na.rm = TRUE),
+              Q3 = quantile(!!sym(logFCcol), 0.75, na.rm = TRUE),
+              num = n(), .groups = "drop")
+  ## Calculate y value for number annotations
+  datSummary$y <- max(yLims) * 0.9
+
+  # Plot
+  plt <- ggplot(datSummary, aes(x = xFact, y = mean_y, color = !!sym(colourCol))) +
+    geom_errorbar(aes(ymin = Q1, ymax = Q3), width = errorBarWidth, linewidth = errorBarLinewidth, alpha = 0.8) +
+    geom_point(size = pointSize) +
+    geom_hline(yintercept = hlineInts, size = 0.235, linetype = "dashed", alpha = 0.5) +
+    geom_text(data = datSummary, aes(x = xFact, y = y, label = num),
+                          size = 1.875 * 3 / 5, colour = "black",
+                          position = position_dodge2(width = 0.9),
+                          inherit.aes = F) +
+    comfy_theme(rotate_x_text = T) +
+    theme(axis.text.x = element_text(colour = "black",size = 5, hjust = 1, vjust = 1, angle = 45),
+          axis.title.x = element_blank()) +
+    lims(y = yLims)
+  return(plt)
+}
 ```
 
 # Regulation vs conservation
@@ -491,6 +537,21 @@ pltLst <- map2(lst, names(lst), function(dat, treat){
 })
 ggarrange(plotlist = pltLst, nrow = 3)
 ggsave_pdfpng(file = "output/images/ubnOmics/regVsCons/abundance/box_abundTop10_consVsPrtsmi", width = 3, height = 2*3)
+
+# Mean +- sd plot
+pltLst <- map2(lst, names(lst), function(dat, treat){
+  plt <- meanIQR_FCs(
+                dat = dat,
+                logFCcol = "log2FC",
+                xCol = "consBox_LysCont",
+                colourCol = "topAbund",
+                yLims = c(-2, 3),
+                hlineInts = c(-1, 0, 1)) + 
+      ggtitle(treat)
+  return(plt)
+})
+ggarrange(plotlist = pltLst, nrow = 3)
+ggsave_pdfpng(file = "output/images/ubnOmics/regVsCons/abundance/meanIQR_abundTop10_consVsPrtsmi", width = 3, height = 2*3)
 ```
 
 
